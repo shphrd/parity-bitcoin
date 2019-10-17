@@ -2,9 +2,10 @@
 
 use std::{ops, str, fmt, io, marker};
 use hex::{ToHex, FromHex, FromHexError};
+use heapsize::HeapSizeOf;
 
 /// Wrapper around `Vec<u8>`
-#[derive(Default, PartialEq, Clone)]
+#[derive(Default, PartialEq, Clone, Eq, Hash)]
 pub struct Bytes(Vec<u8>);
 
 impl Bytes {
@@ -22,6 +23,20 @@ impl Bytes {
 
 	pub fn len(&self) -> usize {
 		self.0.len()
+	}
+
+	pub fn append(&mut self, other: &mut Bytes) {
+		self.0.append(&mut other.0);
+	}
+
+	pub fn split_off(&mut self, at: usize) -> Bytes {
+		Bytes(self.0.split_off(at))
+	}
+}
+
+impl HeapSizeOf for Bytes {
+	fn heap_size_of_children(&self) -> usize {
+		self.0.heap_size_of_children()
 	}
 }
 
@@ -69,7 +84,7 @@ impl io::Write for Bytes {
 
 impl fmt::Debug for Bytes {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		f.write_str(&self.0.to_hex())
+		f.write_str(&self.0.to_hex::<String>())
 	}
 }
 

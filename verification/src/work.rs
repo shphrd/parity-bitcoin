@@ -2,12 +2,14 @@ use std::cmp;
 use primitives::compact::Compact;
 use primitives::hash::H256;
 use primitives::bigint::U256;
-use network::Magic;
-use db::{BlockHeaderProvider, BlockRef};
+use chain::IndexedBlockHeader;
+use network::{Network, ConsensusParams, ConsensusFork};
+use storage::{BlockHeaderProvider, BlockRef};
+use work_bch::work_required_bitcoin_cash;
 
 use constants::{
-	DOUBLE_SPACING_SECONDS,
-	TARGET_TIMESPAN_SECONDS, MIN_TIMESPAN, MAX_TIMESPAN, RETARGETING_INTERVAL
+	DOUBLE_SPACING_SECONDS, TARGET_TIMESPAN_SECONDS,
+	MIN_TIMESPAN, MAX_TIMESPAN, RETARGETING_INTERVAL
 };
 
 pub fn is_retarget_height(height: u32) -> bool {
@@ -55,44 +57,42 @@ pub fn retarget_timespan(retarget_timestamp: u32, last_timestamp: u32) -> u32 {
 }
 
 /// Returns work required for given header
-pub fn work_required(parent_hash: H256, time: u32, height: u32, store: &BlockHeaderProvider, network: Magic) -> Compact {
+pub fn work_required(parent_hash: H256, time: u32, height: u32, store: &dyn BlockHeaderProvider, consensus: &ConsensusParams) -> Compact {
+	let max_bits = consensus.network.max_bits().into();
 	if height == 0 {
-		return network.max_bits();
+		return max_bits;
 	}
 
 	let parent_header = store.block_header(parent_hash.clone().into()).expect("self.height != 0; qed");
 
+	match consensus.fork {
+		ConsensusFork::BitcoinCash(ref fork) if height >= fork.height =>
+			return work_required_bitcoin_cash(parent_header, time, height, store, consensus, fork, max_bits),
+		_ => (),
+	}
+
 	if is_retarget_height(height) {
-		let retarget_ref = (height - RETARGETING_INTERVAL).into();
-		let retarget_header = store.block_header(retarget_ref).expect("self.height != 0 && self.height % RETARGETING_INTERVAL == 0; qed");
-
-		// timestamp of block(height - RETARGETING_INTERVAL)
-		let retarget_timestamp = retarget_header.time;
-		// timestamp of parent block
-		let last_timestamp = parent_header.time;
-		// bits of last block
-		let last_bits = parent_header.bits;
-
-		return work_required_retarget(network.max_bits(), retarget_timestamp, last_timestamp, last_bits);
+		return work_required_retarget(parent_header, height, store, max_bits);
 	}
 
-	if network == Magic::Testnet {
-		return work_required_testnet(parent_hash, time, height, store, network)
+	if consensus.network == Network::Testnet {
+		return work_required_testnet(parent_hash, time, height, store, Network::Testnet)
 	}
 
-	parent_header.bits
+	parent_header.raw.bits
 }
 
-pub fn work_required_testnet(parent_hash: H256, time: u32, height: u32, store: &BlockHeaderProvider, network: Magic) -> Compact {
+pub fn work_required_testnet(parent_hash: H256, time: u32, height: u32, store: &dyn BlockHeaderProvider, network: Network) -> Compact {
 	assert!(height != 0, "cannot calculate required work for genesis block");
 
 	let mut bits = Vec::new();
 	let mut block_ref: BlockRef = parent_hash.into();
 
 	let parent_header = store.block_header(block_ref.clone()).expect("height != 0; qed");
-	let max_time_gap = parent_header.time + DOUBLE_SPACING_SECONDS;
+	let max_time_gap = parent_header.raw.time + DOUBLE_SPACING_SECONDS;
+	let max_bits = network.max_bits().into();
 	if time > max_time_gap {
-		return network.max_bits();
+		return max_bits;
 	}
 
 	// TODO: optimize it, so it does not make 2016!!! redundant queries each time
@@ -101,21 +101,31 @@ pub fn work_required_testnet(parent_hash: H256, time: u32, height: u32, store: &
 			Some(h) => h,
 			None => { break; }
 		};
-		bits.push(previous_header.bits);
-		block_ref = previous_header.previous_header_hash.into();
+		bits.push(previous_header.raw.bits);
+		block_ref = previous_header.raw.previous_header_hash.into();
 	}
 
 	for (index, bit) in bits.into_iter().enumerate() {
-		if bit != network.max_bits() || is_retarget_height(height - index as u32 - 1) {
+		if bit != max_bits || is_retarget_height(height - index as u32 - 1) {
 			return bit;
 		}
 	}
 
-	network.max_bits()
+	max_bits
 }
 
 /// Algorithm used for retargeting work every 2 weeks
-pub fn work_required_retarget(max_work_bits: Compact, retarget_timestamp: u32, last_timestamp: u32, last_bits: Compact) -> Compact {
+pub fn work_required_retarget(parent_header: IndexedBlockHeader, height: u32, store: &dyn BlockHeaderProvider, max_work_bits: Compact) -> Compact {
+	let retarget_ref = (height - RETARGETING_INTERVAL).into();
+	let retarget_header = store.block_header(retarget_ref).expect("self.height != 0 && self.height % RETARGETING_INTERVAL == 0; qed");
+
+	// timestamp of block(height - RETARGETING_INTERVAL)
+	let retarget_timestamp = retarget_header.raw.time;
+	// timestamp of parent block
+	let last_timestamp = parent_header.raw.time;
+	// bits of last block
+	let last_bits = parent_header.raw.bits;
+
 	let mut retarget: U256 = last_bits.into();
 	let maximum: U256 = max_work_bits.into();
 
@@ -139,7 +149,7 @@ pub fn block_reward_satoshi(block_height: u32) -> u64 {
 mod tests {
 	use primitives::hash::H256;
 	use primitives::compact::Compact;
-	use network::Magic;
+	use network::Network;
 	use super::{is_valid_proof_of_work_hash, is_valid_proof_of_work, block_reward_satoshi};
 
 	fn is_valid_pow(max: Compact, bits: u32, hash: &'static str) -> bool {
@@ -150,14 +160,14 @@ mod tests {
 	#[test]
 	fn test_is_valid_proof_of_work() {
 		// block 2
-		assert!(is_valid_pow(Magic::Mainnet.max_bits(), 486604799u32, "000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd"));
+		assert!(is_valid_pow(Network::Mainnet.max_bits().into(), 486604799u32, "000000006a625f06636b8bb6ac7b960a8d03705d1ace08b1a19da3fdcc99ddbd"));
 		// block 400_000
-		assert!(is_valid_pow(Magic::Mainnet.max_bits(), 403093919u32, "000000000000000004ec466ce4732fe6f1ed1cddc2ed4b328fff5224276e3f6f"));
+		assert!(is_valid_pow(Network::Mainnet.max_bits().into(), 403093919u32, "000000000000000004ec466ce4732fe6f1ed1cddc2ed4b328fff5224276e3f6f"));
 
 		// other random tests
-		assert!(is_valid_pow(Magic::Regtest.max_bits(), 0x181bc330u32, "00000000000000001bc330000000000000000000000000000000000000000000"));
-		assert!(!is_valid_pow(Magic::Regtest.max_bits(), 0x181bc330u32, "00000000000000001bc330000000000000000000000000000000000000000001"));
-		assert!(!is_valid_pow(Magic::Regtest.max_bits(), 0x181bc330u32, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
+		assert!(is_valid_pow(Network::Regtest.max_bits().into(), 0x181bc330u32, "00000000000000001bc330000000000000000000000000000000000000000000"));
+		assert!(!is_valid_pow(Network::Regtest.max_bits().into(), 0x181bc330u32, "00000000000000001bc330000000000000000000000000000000000000000001"));
+		assert!(!is_valid_pow(Network::Regtest.max_bits().into(), 0x181bc330u32, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"));
 	}
 
 	#[test]

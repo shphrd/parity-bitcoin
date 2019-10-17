@@ -19,11 +19,13 @@ pub enum Error {
 	NumberNotMinimallyEncoded,
 	SigCount,
 	PubkeyCount,
+	InvalidOperandSize,
 
 	// Failed verify operations
 	Verify,
 	EqualVerify,
 	CheckSigVerify,
+	CheckDataSigVerify,
 	NumEqualVerify,
 
 	// Logical/Format/Canonical errors.
@@ -32,6 +34,9 @@ pub enum Error {
 	InvalidStackOperation,
 	InvalidAltstackOperation,
 	UnbalancedConditional,
+	InvalidSplitRange,
+	DivisionByZero,
+	ImpossibleEncoding,
 
 	// CHECKLOCKTIMEVERIFY and CHECKSEQUENCEVERIFY
 	NegativeLocktime,
@@ -40,6 +45,8 @@ pub enum Error {
 	// BIP62
 	SignatureHashtype,
 	SignatureDer,
+	SignatureIllegalForkId,
+	SignatureMustUseForkId,
 	Minimaldata,
 	SignaturePushOnly,
 	SignatureHighS,
@@ -49,6 +56,16 @@ pub enum Error {
 
 	// Softfork safeness
 	DiscourageUpgradableNops,
+	DiscourageUpgradableWitnessProgram,
+
+	// SegWit-related errors
+	WitnessProgramWrongLength,
+	WitnessProgramWitnessEmpty,
+	WitnessProgramMismatch,
+	WitnessMalleated,
+	WitnessMalleatedP2SH,
+	WitnessUnexpected,
+	WitnessPubKeyType,
 }
 
 impl fmt::Display for Error {
@@ -62,6 +79,7 @@ impl fmt::Display for Error {
 			Error::Verify => "Failed verify operation".fmt(f),
 			Error::EqualVerify => "Failed equal verify operation".fmt(f),
 			Error::CheckSigVerify => "Failed signature check".fmt(f),
+			Error::CheckDataSigVerify => "Failed data signature check".fmt(f),
 			Error::NumEqualVerify => "Failed num equal verify operation".fmt(f),
 			Error::SigCount => "Maximum number of signature exceeded".fmt(f),
 			Error::PubkeyCount => "Maximum number of pubkeys per multisig exceeded".fmt(f),
@@ -80,6 +98,10 @@ impl fmt::Display for Error {
 			Error::InvalidStackOperation => "Invalid stack operation".fmt(f),
 			Error::InvalidAltstackOperation => "Invalid altstack operation".fmt(f),
 			Error::UnbalancedConditional => "Unbalanced conditional".fmt(f),
+			Error::InvalidSplitRange => "Invalid OP_SPLIT range".fmt(f),
+			Error::InvalidOperandSize => "Invalid operand size".fmt(f),
+			Error::DivisionByZero => "Invalid division operation".fmt(f),
+			Error::ImpossibleEncoding => "The requested encoding is impossible to satisfy".fmt(f),
 
 			// CHECKLOCKTIMEVERIFY and CHECKSEQUENCEVERIFY
 			Error::NegativeLocktime => "Negative locktime".fmt(f),
@@ -88,6 +110,8 @@ impl fmt::Display for Error {
 			// BIP62
 			Error::SignatureHashtype => "Invalid Signature Hashtype".fmt(f),
 			Error::SignatureDer => "Invalid Signature".fmt(f),
+			Error::SignatureIllegalForkId => "Illegal use of SIGHASH_FORKID".fmt(f),
+			Error::SignatureMustUseForkId => "Signature must use SIGHASH_FORKID".fmt(f),
 			Error::Minimaldata => "Check minimaldata failed".fmt(f),
 			Error::SignaturePushOnly => "Only push opcodes are allowed in this signature".fmt(f),
 			Error::SignatureHighS => "Invalid High S in Signature".fmt(f),
@@ -97,6 +121,16 @@ impl fmt::Display for Error {
 
 			// Softfork safeness
 			Error::DiscourageUpgradableNops => "Discourage Upgradable Nops".fmt(f),
+			Error::DiscourageUpgradableWitnessProgram => "Discourage Upgradable Witness Program".fmt(f),
+
+			// SegWit-related errors
+			Error::WitnessProgramWrongLength => "Witness program has incorrect length".fmt(f),
+			Error::WitnessProgramWitnessEmpty => "Witness program was passed an empty witness".fmt(f),
+			Error::WitnessProgramMismatch => "Witness program hash mismatch".fmt(f),
+			Error::WitnessMalleated => "Witness requires empty scriptSig".fmt(f),
+			Error::WitnessMalleatedP2SH => "Witness requires only-redeemscript scriptSig".fmt(f),
+			Error::WitnessUnexpected => "Witness provided for non-witness script".fmt(f),
+			Error::WitnessPubKeyType => "Using non-compressed keys in segwit".fmt(f),
 		}
 	}
 }

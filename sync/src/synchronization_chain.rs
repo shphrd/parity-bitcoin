@@ -1,9 +1,10 @@
 use std::collections::{VecDeque, HashSet};
 use std::fmt;
 use linked_hash_map::LinkedHashMap;
-use chain::{BlockHeader, Transaction, IndexedBlockHeader, IndexedBlock, IndexedTransaction};
-use db;
-use miner::{MemoryPoolOrderingStrategy, MemoryPoolInformation};
+use chain::{IndexedBlockHeader, IndexedBlock, IndexedTransaction, OutPoint, TransactionOutput};
+use storage;
+use miner::{MemoryPoolOrderingStrategy, MemoryPoolInformation, FeeCalculator};
+use network::ConsensusParams;
 use primitives::bytes::Bytes;
 use primitives::hash::H256;
 use utils::{BestHeadersChain, BestHeadersChainInformation, HashQueueChain, HashPosition};
@@ -101,7 +102,7 @@ pub struct Chain {
 	/// Genesis block hash (stored for optimizations)
 	genesis_block_hash: H256,
 	/// Best storage block (stored for optimizations)
-	best_storage_block: db::BestBlock,
+	best_storage_block: storage::BestBlock,
 	/// Local blocks storage
 	storage: StorageRef,
 	/// In-memory queue of blocks hashes
@@ -114,6 +115,9 @@ pub struct Chain {
 	memory_pool: MemoryPoolRef,
 	/// Blocks that have been marked as dead-ends
 	dead_end_blocks: HashSet<H256>,
+	/// Is SegWit is possible on this chain? SegWit inventory types are used when block/tx-es are
+	/// requested and this flag is true.
+	is_segwit_possible: bool,
 }
 
 impl BlockState {
@@ -138,12 +142,13 @@ impl BlockState {
 
 impl Chain {
 	/// Create new `Chain` with given storage
-	pub fn new(storage: StorageRef, memory_pool: MemoryPoolRef) -> Self {
+	pub fn new(storage: StorageRef, consensus: ConsensusParams, memory_pool: MemoryPoolRef) -> Self {
 		// we only work with storages with genesis block
 		let genesis_block_hash = storage.block_hash(0)
 			.expect("storage with genesis block is required");
 		let best_storage_block = storage.best_block();
 		let best_storage_block_hash = best_storage_block.hash.clone();
+		let is_segwit_possible = consensus.is_segwit_possible();
 
 		Chain {
 			genesis_block_hash: genesis_block_hash,
@@ -154,6 +159,7 @@ impl Chain {
 			verifying_transactions: LinkedHashMap::new(),
 			memory_pool: memory_pool,
 			dead_end_blocks: HashSet::new(),
+			is_segwit_possible,
 		}
 	}
 
@@ -179,6 +185,11 @@ impl Chain {
 		self.memory_pool.clone()
 	}
 
+	/// Is segwit active
+	pub fn is_segwit_possible(&self) -> bool {
+		self.is_segwit_possible
+	}
+
 	/// Get number of blocks in given state
 	pub fn length_of_blocks_state(&self, state: BlockState) -> BlockHeight {
 		match state {
@@ -196,9 +207,9 @@ impl Chain {
 	}
 
 	/// Get best block
-	pub fn best_block(&self) -> db::BestBlock {
+	pub fn best_block(&self) -> storage::BestBlock {
 		match self.hash_chain.back() {
-			Some(hash) => db::BestBlock {
+			Some(hash) => storage::BestBlock {
 				number: self.best_storage_block.number + self.hash_chain.len(),
 				hash: hash.clone(),
 			},
@@ -207,17 +218,17 @@ impl Chain {
 	}
 
 	/// Get best storage block
-	pub fn best_storage_block(&self) -> db::BestBlock {
+	pub fn best_storage_block(&self) -> storage::BestBlock {
 		self.best_storage_block.clone()
 	}
 
 	/// Get best block header
-	pub fn best_block_header(&self) -> db::BestBlock {
+	pub fn best_block_header(&self) -> storage::BestBlock {
 		let headers_chain_information = self.headers_chain.information();
 		if headers_chain_information.best == 0 {
 			return self.best_storage_block()
 		}
-		db::BestBlock {
+		storage::BestBlock {
 			number: self.best_storage_block.number + headers_chain_information.best,
 			hash: self.headers_chain.at(headers_chain_information.best - 1)
 				.expect("got this index above; qed")
@@ -246,7 +257,7 @@ impl Chain {
 	/// Get block header by number
 	pub fn block_header_by_number(&self, number: BlockHeight) -> Option<IndexedBlockHeader> {
 		if number <= self.best_storage_block.number {
-			self.storage.block_header(db::BlockRef::Number(number)).map(Into::into)
+			self.storage.block_header(storage::BlockRef::Number(number))
 		} else {
 			self.headers_chain.at(number - self.best_storage_block.number)
 		}
@@ -254,8 +265,8 @@ impl Chain {
 
 	/// Get block header by hash
 	pub fn block_header_by_hash(&self, hash: &H256) -> Option<IndexedBlockHeader> {
-		if let Some(block) = self.storage.block(db::BlockRef::Hash(hash.clone())) {
-			return Some(block.block_header.into());
+		if let Some(header) = self.storage.block_header(storage::BlockRef::Hash(hash.clone())) {
+			return Some(header);
 		}
 		self.headers_chain.by_hash(hash)
 	}
@@ -264,7 +275,7 @@ impl Chain {
 	pub fn block_state(&self, hash: &H256) -> BlockState {
 		match self.hash_chain.contains_in(hash) {
 			Some(queue_index) => BlockState::from_queue_index(queue_index),
-			None => if self.storage.contains_block(db::BlockRef::Hash(hash.clone())) {
+			None => if self.storage.contains_block(storage::BlockRef::Hash(hash.clone())) {
 				BlockState::Stored
 			} else if self.dead_end_blocks.contains(hash) {
 				BlockState::DeadEnd
@@ -333,23 +344,22 @@ impl Chain {
 	}
 
 	/// Insert new best block to storage
-	pub fn insert_best_block(&mut self, block: &IndexedBlock) -> Result<BlockInsertionResult, db::Error> {
-		trace!(target: "sync", "insert_best_block {:?} best_block: {:?}", block.hash().reversed(), self.storage.best_block());
+	pub fn insert_best_block(&mut self, block: IndexedBlock) -> Result<BlockInsertionResult, storage::Error> {
 		assert_eq!(Some(self.storage.best_block().hash), self.storage.block_hash(self.storage.best_block().number));
 		let block_origin = self.storage.block_origin(&block.header)?;
 		trace!(target: "sync", "insert_best_block {:?} origin: {:?}", block.hash().reversed(), block_origin);
 		match block_origin {
-			db::BlockOrigin::KnownBlock => {
+			storage::BlockOrigin::KnownBlock => {
 				// there should be no known blocks at this point
 				unreachable!();
 			},
 			// case 1: block has been added to the main branch
-			db::BlockOrigin::CanonChain { .. } => {
-				self.storage.insert(block)?;
+			storage::BlockOrigin::CanonChain { .. } => {
+				self.storage.insert(block.clone())?;
 				self.storage.canonize(block.hash())?;
 
 				// remember new best block hash
-				self.best_storage_block = self.storage.best_block();
+				self.best_storage_block = self.storage.as_store().best_block();
 
 				// remove inserted block + handle possible reorganization in headers chain
 				// TODO: mk, not sure if we need both of those params
@@ -377,9 +387,9 @@ impl Chain {
 				})
 			},
 			// case 2: block has been added to the side branch with reorganization to this branch
-			db::BlockOrigin::SideChainBecomingCanonChain(origin) => {
+			storage::BlockOrigin::SideChainBecomingCanonChain(origin) => {
 				let fork = self.storage.fork(origin.clone())?;
-				fork.store().insert(block)?;
+				fork.store().insert(block.clone())?;
 				fork.store().canonize(block.hash())?;
 				self.storage.switch_to_fork(fork)?;
 
@@ -407,7 +417,7 @@ impl Chain {
 
 				// reverify all transactions from old main branch' blocks
 				let old_main_blocks_transactions = origin.decanonized_route.into_iter()
-					.flat_map(|block_hash| self.storage.indexed_block_transactions(block_hash.into()))
+					.flat_map(|block_hash| self.storage.block_transactions(block_hash.into()))
 					.collect::<Vec<_>>();
 
 				trace!(target: "sync", "insert_best_block, old_main_blocks_transactions: {:?}",
@@ -444,12 +454,13 @@ impl Chain {
 				Ok(result)
 			},
 			// case 3: block has been added to the side branch without reorganization to this branch
-			db::BlockOrigin::SideChain(_origin) => {
+			storage::BlockOrigin::SideChain(_origin) => {
+				let block_hash = block.hash().clone();
 				self.storage.insert(block)?;
 
 				// remove inserted block + handle possible reorganization in headers chain
 				// TODO: mk, not sure if it's needed here at all
-				self.headers_chain.block_inserted_to_storage(block.hash(), &self.best_storage_block.hash);
+				self.headers_chain.block_inserted_to_storage(&block_hash, &self.best_storage_block.hash);
 
 				// no transactions were accepted
 				// no transactions to reverify
@@ -591,7 +602,9 @@ impl Chain {
 	/// Get transaction by hash (if it's in memory pool or verifying)
 	pub fn transaction_by_hash(&self, hash: &H256) -> Option<IndexedTransaction> {
 		self.verifying_transactions.get(hash).cloned()
-			.or_else(|| self.memory_pool.read().read_by_hash(hash).cloned().map(|t| t.into()))
+			.or_else(|| self.memory_pool.read().read_by_hash(hash)
+				.cloned()
+				.map(|tx| IndexedTransaction::new(hash.clone(), tx)))
 	}
 
 	/// Insert transaction to memory pool
@@ -604,7 +617,7 @@ impl Chain {
 			memory_pool.remove_by_prevout(&input.previous_output);
 		}
 		// now insert transaction itself
-		memory_pool.insert_verified(transaction);
+		memory_pool.insert_verified(transaction, &FeeCalculator(self.storage.as_transaction_output_provider()));
 	}
 
 	/// Calculate block locator hashes for hash queue
@@ -653,35 +666,47 @@ impl Chain {
 	}
 }
 
-impl db::TransactionProvider for Chain {
+impl storage::TransactionProvider for Chain {
 	fn transaction_bytes(&self, hash: &H256) -> Option<Bytes> {
 		self.memory_pool.read().transaction_bytes(hash)
 			.or_else(|| self.storage.transaction_bytes(hash))
 	}
 
-	fn transaction(&self, hash: &H256) -> Option<Transaction> {
+	fn transaction(&self, hash: &H256) -> Option<IndexedTransaction> {
 		self.memory_pool.read().transaction(hash)
 			.or_else(|| self.storage.transaction(hash))
 	}
 }
 
-impl db::BlockHeaderProvider for Chain {
-	fn block_header_bytes(&self, block_ref: db::BlockRef) -> Option<Bytes> {
-		use ser::serialize;
-		self.block_header(block_ref).map(|h| serialize(&h))
+impl storage::TransactionOutputProvider for Chain {
+	fn transaction_output(&self, outpoint: &OutPoint, transaction_index: usize) -> Option<TransactionOutput> {
+		self.memory_pool.read().transaction_output(outpoint, transaction_index)
+			.or_else(|| self.storage.transaction_output(outpoint, transaction_index))
 	}
 
-	fn block_header(&self, block_ref: db::BlockRef) -> Option<BlockHeader> {
+	fn is_spent(&self, outpoint: &OutPoint) -> bool {
+		self.memory_pool.read().is_spent(outpoint)
+			|| self.storage.is_spent(outpoint)
+	}
+}
+
+impl storage::BlockHeaderProvider for Chain {
+	fn block_header_bytes(&self, block_ref: storage::BlockRef) -> Option<Bytes> {
+		use ser::serialize;
+		self.block_header(block_ref).map(|h| serialize(&h.raw))
+	}
+
+	fn block_header(&self, block_ref: storage::BlockRef) -> Option<IndexedBlockHeader> {
 		match block_ref {
-			db::BlockRef::Hash(hash) => self.block_header_by_hash(&hash).map(|h| h.raw),
-			db::BlockRef::Number(n) => self.block_header_by_number(n).map(|h| h.raw),
+			storage::BlockRef::Hash(hash) => self.block_header_by_hash(&hash),
+			storage::BlockRef::Number(n) => self.block_header_by_number(n),
 		}
 	}
 }
 
 impl fmt::Debug for Information {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "[sch:{} / bh:{} -> req:{} -> vfy:{} -> stored: {}]", self.scheduled, self.headers.best, self.requested, self.verifying, self.stored)
+		write!(f, "[sch:{} -> req:{} -> vfy:{} -> stored: {}]", self.scheduled, self.requested, self.verifying, self.stored)
 	}
 }
 
@@ -723,6 +748,7 @@ mod tests {
 	use chain::{Transaction, IndexedBlockHeader};
 	use db::BlockChainDatabase;
 	use miner::MemoryPool;
+	use network::{Network, ConsensusParams, ConsensusFork};
 	use primitives::hash::H256;
 	use super::{Chain, BlockState, TransactionState, BlockInsertionResult};
 	use utils::HashPosition;
@@ -731,7 +757,7 @@ mod tests {
 	fn chain_empty() {
 		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
 		let db_best_block = db.best_block();
-		let chain = Chain::new(db.clone(), Arc::new(RwLock::new(MemoryPool::new())));
+		let chain = Chain::new(db.clone(), ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 		assert_eq!(chain.information().scheduled, 0);
 		assert_eq!(chain.information().requested, 0);
 		assert_eq!(chain.information().verifying, 0);
@@ -748,7 +774,7 @@ mod tests {
 	#[test]
 	fn chain_block_path() {
 		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
-		let mut chain = Chain::new(db.clone(), Arc::new(RwLock::new(MemoryPool::new())));
+		let mut chain = Chain::new(db.clone(), ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 
 		// add 6 blocks to scheduled queue
 		let blocks = test_data::build_n_empty_blocks_from_genesis(6, 0);
@@ -791,7 +817,7 @@ mod tests {
 		assert!(chain.information().scheduled == 3 && chain.information().requested == 1
 			&& chain.information().verifying == 1 && chain.information().stored == 1);
 		// insert new best block to the chain
-		chain.insert_best_block(&test_data::block_h1().into()).expect("Db error");
+		chain.insert_best_block(test_data::block_h1().into()).expect("Db error");
 		assert!(chain.information().scheduled == 3 && chain.information().requested == 1
 			&& chain.information().verifying == 1 && chain.information().stored == 2);
 		assert_eq!(db.best_block().number, 1);
@@ -800,20 +826,20 @@ mod tests {
 	#[test]
 	fn chain_block_locator_hashes() {
 		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
-		let mut chain = Chain::new(db, Arc::new(RwLock::new(MemoryPool::new())));
+		let mut chain = Chain::new(db, ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 		let genesis_hash = chain.best_block().hash;
 		assert_eq!(chain.block_locator_hashes(), vec![genesis_hash.clone()]);
 
 		let block1 = test_data::block_h1();
 		let block1_hash = block1.hash();
 
-		chain.insert_best_block(&block1.into()).expect("Error inserting new block");
+		chain.insert_best_block(block1.into()).expect("Error inserting new block");
 		assert_eq!(chain.block_locator_hashes(), vec![block1_hash.clone(), genesis_hash.clone()]);
 
 		let block2 = test_data::block_h2();
 		let block2_hash = block2.hash();
 
-		chain.insert_best_block(&block2.into()).expect("Error inserting new block");
+		chain.insert_best_block(block2.into()).expect("Error inserting new block");
 		assert_eq!(chain.block_locator_hashes(), vec![block2_hash.clone(), block1_hash.clone(), genesis_hash.clone()]);
 
 		let blocks0 = test_data::build_n_empty_blocks_from_genesis(11, 0);
@@ -884,19 +910,19 @@ mod tests {
 
 	#[test]
 	fn chain_transaction_state() {
-		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
-		let mut chain = Chain::new(db, Arc::new(RwLock::new(MemoryPool::new())));
+		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into(), test_data::block_h1().into()]));
+		let mut chain = Chain::new(db, ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 		let genesis_block = test_data::genesis();
-		let block1 = test_data::block_h1();
+		let block2 = test_data::block_h2();
 		let tx1: Transaction = test_data::TransactionBuilder::with_version(1).into();
-		let tx2: Transaction = test_data::TransactionBuilder::with_version(2).into();
+		let tx2: Transaction = test_data::TransactionBuilder::with_input(&test_data::genesis().transactions[0], 0).into();
 		let tx1_hash = tx1.hash();
 		let tx2_hash = tx2.hash();
 		chain.verify_transaction(tx1.into());
 		chain.insert_verified_transaction(tx2.into());
 
 		assert_eq!(chain.transaction_state(&genesis_block.transactions[0].hash()), TransactionState::Stored);
-		assert_eq!(chain.transaction_state(&block1.transactions[0].hash()), TransactionState::Unknown);
+		assert_eq!(chain.transaction_state(&block2.transactions[0].hash()), TransactionState::Unknown);
 		assert_eq!(chain.transaction_state(&tx1_hash), TransactionState::Verifying);
 		assert_eq!(chain.transaction_state(&tx2_hash), TransactionState::InMemory);
 	}
@@ -922,7 +948,7 @@ mod tests {
 		let tx2_hash = tx2.hash();
 
 		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![b0.into()]));
-		let mut chain = Chain::new(db, Arc::new(RwLock::new(MemoryPool::new())));
+		let mut chain = Chain::new(db, ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 		chain.verify_transaction(tx1.into());
 		chain.insert_verified_transaction(tx2.into());
 
@@ -930,7 +956,7 @@ mod tests {
 		assert_eq!(chain.information().transactions.transactions_count, 1);
 
 		// when block is inserted to the database => all accepted transactions are removed from mempool && verifying queue
-		chain.insert_best_block(&b1.into()).expect("block accepted");
+		chain.insert_best_block(b1.into()).expect("block accepted");
 
 		assert_eq!(chain.information().transactions.transactions_count, 0);
 		assert!(!chain.forget_verifying_transaction(&tx1_hash));
@@ -946,7 +972,7 @@ mod tests {
 			.set_default_input(0).set_output(400).store(test_chain);		// t4
 
 		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
-		let mut chain = Chain::new(db, Arc::new(RwLock::new(MemoryPool::new())));
+		let mut chain = Chain::new(db, ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 		chain.verify_transaction(test_chain.at(0).into());
 		chain.verify_transaction(test_chain.at(1).into());
 		chain.verify_transaction(test_chain.at(2).into());
@@ -961,14 +987,17 @@ mod tests {
 
 	#[test]
 	fn chain_transactions_hashes_with_state() {
+		let input_tx1 = test_data::genesis().transactions[0].clone();
+		let input_tx2 = test_data::block_h1().transactions[0].clone();
 		let test_chain = &mut test_data::ChainBuilder::new();
-		test_data::TransactionBuilder::with_output(100).store(test_chain)	// t1
-			.into_input(0).add_output(200).store(test_chain)				// t1 -> t2
+		test_data::TransactionBuilder::with_input(&input_tx1, 0)
+				.add_output(1_000).store(test_chain)						// t1
+			.into_input(0).add_output(400).store(test_chain)				// t1 -> t2
 			.into_input(0).add_output(300).store(test_chain)				// t1 -> t2 -> t3
-			.set_default_input(0).set_output(400).store(test_chain);		// t4
+			.set_input(&input_tx2, 0).set_output(400).store(test_chain);		// t4
 
-		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
-		let mut chain = Chain::new(db, Arc::new(RwLock::new(MemoryPool::new())));
+		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into(), test_data::block_h1().into()]));
+		let mut chain = Chain::new(db, ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 		chain.insert_verified_transaction(test_chain.at(0).into());
 		chain.insert_verified_transaction(test_chain.at(1).into());
 		chain.insert_verified_transaction(test_chain.at(2).into());
@@ -983,31 +1012,35 @@ mod tests {
 
 	#[test]
 	fn memory_pool_transactions_are_reverified_after_reorganization() {
-		let b0 = test_data::block_builder().header().build().build();
+		let b0 = test_data::block_builder()
+			.header().build()
+			.transaction().coinbase().output().value(100_000).build().build()
+			.build();
 		let b1 = test_data::block_builder().header().nonce(1).parent(b0.hash()).build().build();
 		let b2 = test_data::block_builder().header().nonce(2).parent(b0.hash()).build().build();
 		let b3 = test_data::block_builder().header().parent(b2.hash()).build().build();
 
-		let tx1: Transaction = test_data::TransactionBuilder::with_version(1).into();
+		let input_tx = b0.transactions[0].clone();
+		let tx1: Transaction = test_data::TransactionBuilder::with_version(1).set_input(&input_tx, 0).into();
 		let tx1_hash = tx1.hash();
-		let tx2: Transaction = test_data::TransactionBuilder::with_version(2).into();
+		let tx2: Transaction = test_data::TransactionBuilder::with_input(&input_tx, 0).into();
 		let tx2_hash = tx2.hash();
 
 		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![b0.into()]));
-		let mut chain = Chain::new(db, Arc::new(RwLock::new(MemoryPool::new())));
+		let mut chain = Chain::new(db, ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 		chain.verify_transaction(tx1.into());
 		chain.insert_verified_transaction(tx2.into());
 
 		// no reorg
-		let result = chain.insert_best_block(&b1.into()).expect("no error");
+		let result = chain.insert_best_block(b1.into()).expect("no error");
 		assert_eq!(result.transactions_to_reverify.len(), 0);
 
 		// no reorg
-		let result = chain.insert_best_block(&b2.into()).expect("no error");
+		let result = chain.insert_best_block(b2.into()).expect("no error");
 		assert_eq!(result.transactions_to_reverify.len(), 0);
 
 		// reorg
-		let result = chain.insert_best_block(&b3.into()).expect("no error");
+		let result = chain.insert_best_block(b3.into()).expect("no error");
 		assert_eq!(result.transactions_to_reverify.len(), 2);
 		assert!(result.transactions_to_reverify.iter().any(|ref tx| &tx.hash == &tx1_hash));
 		assert!(result.transactions_to_reverify.iter().any(|ref tx| &tx.hash == &tx2_hash));
@@ -1016,6 +1049,7 @@ mod tests {
 	#[test]
 	fn fork_chain_block_transaction_is_removed_from_on_block_insert() {
 		let genesis = test_data::genesis();
+		let input_tx = genesis.transactions[0].clone();
 		let b0 = test_data::block_builder().header().parent(genesis.hash()).build().build(); // genesis -> b0
 		let b1 = test_data::block_builder().header().nonce(1).parent(b0.hash()).build()
 			.transaction().output().value(10).build().build()
@@ -1024,13 +1058,16 @@ mod tests {
 			.transaction().output().value(20).build().build()
 			.build(); // genesis -> b0 -> b1[tx1] -> b2[tx2]
 		let b3 = test_data::block_builder().header().nonce(2).parent(b0.hash()).build()
-			.transaction().output().value(30).build().build()
+			.transaction().input().hash(input_tx.hash()).index(0).build()
+			.output().value(50).build().build()
 			.build(); // genesis -> b0 -> b3[tx3]
 		let b4 = test_data::block_builder().header().parent(b3.hash()).build()
-			.transaction().output().value(40).build().build()
+			.transaction().input().hash(b3.transactions[0].hash()).index(0).build()
+				.output().value(40).build().build()
 			.build(); // genesis -> b0 -> b3[tx3] -> b4[tx4]
 		let b5 = test_data::block_builder().header().parent(b4.hash()).build()
-			.transaction().output().value(50).build().build()
+			.transaction().input().hash(b4.transactions[0].hash()).index(0).build()
+				.output().value(30).build().build()
 			.build(); // genesis -> b0 -> b3[tx3] -> b4[tx4] -> b5[tx5]
 
 		let tx1 = b1.transactions[0].clone();
@@ -1042,24 +1079,24 @@ mod tests {
 		let tx5 = b5.transactions[0].clone();
 
 		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![genesis.into()]));
-		let mut chain = Chain::new(db, Arc::new(RwLock::new(MemoryPool::new())));
+		let mut chain = Chain::new(db, ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 
 		chain.insert_verified_transaction(tx3.into());
 		chain.insert_verified_transaction(tx4.into());
 		chain.insert_verified_transaction(tx5.into());
 
-		assert_eq!(chain.insert_best_block(&b0.clone().into()).expect("block accepted"), BlockInsertionResult::with_canonized_blocks(vec![b0.hash()]));
+		assert_eq!(chain.insert_best_block(b0.clone().into()).expect("block accepted"), BlockInsertionResult::with_canonized_blocks(vec![b0.hash()]));
 		assert_eq!(chain.information().transactions.transactions_count, 3);
-		assert_eq!(chain.insert_best_block(&b1.clone().into()).expect("block accepted"), BlockInsertionResult::with_canonized_blocks(vec![b1.hash()]));
+		assert_eq!(chain.insert_best_block(b1.clone().into()).expect("block accepted"), BlockInsertionResult::with_canonized_blocks(vec![b1.hash()]));
 		assert_eq!(chain.information().transactions.transactions_count, 3);
-		assert_eq!(chain.insert_best_block(&b2.clone().into()).expect("block accepted"), BlockInsertionResult::with_canonized_blocks(vec![b2.hash()]));
+		assert_eq!(chain.insert_best_block(b2.clone().into()).expect("block accepted"), BlockInsertionResult::with_canonized_blocks(vec![b2.hash()]));
 		assert_eq!(chain.information().transactions.transactions_count, 3);
-		assert_eq!(chain.insert_best_block(&b3.clone().into()).expect("block accepted"), BlockInsertionResult::default());
+		assert_eq!(chain.insert_best_block(b3.clone().into()).expect("block accepted"), BlockInsertionResult::default());
 		assert_eq!(chain.information().transactions.transactions_count, 3);
-		assert_eq!(chain.insert_best_block(&b4.clone().into()).expect("block accepted"), BlockInsertionResult::default());
+		assert_eq!(chain.insert_best_block(b4.clone().into()).expect("block accepted"), BlockInsertionResult::default());
 		assert_eq!(chain.information().transactions.transactions_count, 3);
 		// order matters
-		let insert_result = chain.insert_best_block(&b5.clone().into()).expect("block accepted");
+		let insert_result = chain.insert_best_block(b5.clone().into()).expect("block accepted");
 		let transactions_to_reverify_hashes: Vec<_> = insert_result
 			.transactions_to_reverify
 			.into_iter()
@@ -1080,35 +1117,35 @@ mod tests {
 				.input().hash(tx0.hash()).index(0).build()
 				.build()
 			.build(); // genesis -> b0[tx1]
-		// tx1 && tx2 are spending same output
+		// tx from b0 && tx2 are spending same output
 		let tx2: Transaction = test_data::TransactionBuilder::with_output(20).add_input(&tx0, 0).into();
-		let tx3: Transaction = test_data::TransactionBuilder::with_output(20).add_input(&tx0, 1).into();
 
 		// insert tx2 to memory pool
 		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
-		let mut chain = Chain::new(db, Arc::new(RwLock::new(MemoryPool::new())));
+		let mut chain = Chain::new(db, ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
 		chain.insert_verified_transaction(tx2.clone().into());
-		chain.insert_verified_transaction(tx3.clone().into());
 		// insert verified block with tx1
-		chain.insert_best_block(&b0.into()).expect("no error");
+		chain.insert_best_block(b0.into()).expect("no error");
 		// => tx2 is removed from memory pool, but tx3 remains
-		assert_eq!(chain.information().transactions.transactions_count, 1);
+		assert_eq!(chain.information().transactions.transactions_count, 0);
 	}
 
 	#[test]
 	fn update_memory_pool_transaction() {
 		use self::test_data::{ChainBuilder, TransactionBuilder};
 
+		let input_tx = test_data::genesis().transactions[0].clone();
 		let data_chain = &mut ChainBuilder::new();
-		TransactionBuilder::with_output(10).add_output(10).add_output(10).store(data_chain)		// transaction0
+		TransactionBuilder::with_input(&input_tx, 0).set_output(100).store(data_chain)			// transaction0
 			.reset().set_input(&data_chain.at(0), 0).add_output(20).lock().store(data_chain)	// transaction0 -> transaction1
 			.reset().set_input(&data_chain.at(0), 0).add_output(30).store(data_chain);			// transaction0 -> transaction2
 
 		let db = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
-		let mut chain = Chain::new(db, Arc::new(RwLock::new(MemoryPool::new())));
+		let mut chain = Chain::new(db, ConsensusParams::new(Network::Unitest, ConsensusFork::BitcoinCore), Arc::new(RwLock::new(MemoryPool::new())));
+		chain.insert_verified_transaction(data_chain.at(0).into());
 		chain.insert_verified_transaction(data_chain.at(1).into());
-		assert_eq!(chain.information().transactions.transactions_count, 1);
+		assert_eq!(chain.information().transactions.transactions_count, 2);
 		chain.insert_verified_transaction(data_chain.at(2).into());
-		assert_eq!(chain.information().transactions.transactions_count, 1); // tx was replaces
+		assert_eq!(chain.information().transactions.transactions_count, 2); // tx was replaced
 	}
 }

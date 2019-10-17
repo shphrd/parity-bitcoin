@@ -1,9 +1,10 @@
-use network::{Magic, ConsensusParams};
-use db::BlockHeaderProvider;
+use network::ConsensusParams;
+use storage::BlockHeaderProvider;
 use canon::CanonHeader;
 use error::Error;
 use work::work_required;
 use timestamp::median_timestamp;
+use deployments::Deployments;
 
 pub struct HeaderAcceptor<'a> {
 	pub version: HeaderVersion<'a>,
@@ -12,13 +13,18 @@ pub struct HeaderAcceptor<'a> {
 }
 
 impl<'a> HeaderAcceptor<'a> {
-	pub fn new(store: &'a BlockHeaderProvider, network: Magic, header: CanonHeader<'a>, height: u32) -> Self {
-		let params = network.consensus_params();
+	pub fn new<D: AsRef<Deployments>>(
+		store: &'a dyn BlockHeaderProvider,
+		consensus: &'a ConsensusParams,
+		header: CanonHeader<'a>,
+		height: u32,
+		deployments: D,
+	) -> Self {
+		let csv_active = deployments.as_ref().csv(height, store, consensus);
 		HeaderAcceptor {
-			// TODO: check last 1000 blocks instead of hardcoding the value
-			version: HeaderVersion::new(header, height, params),
-			work: HeaderWork::new(header, store, height, network),
-			median_timestamp: HeaderMedianTimestamp::new(header, store, network),
+			work: HeaderWork::new(header, store, height, consensus),
+			median_timestamp: HeaderMedianTimestamp::new(header, store, csv_active),
+			version: HeaderVersion::new(header, height, consensus),
 		}
 	}
 
@@ -35,11 +41,11 @@ impl<'a> HeaderAcceptor<'a> {
 pub struct HeaderVersion<'a> {
 	header: CanonHeader<'a>,
 	height: u32,
-	consensus_params: ConsensusParams,
+	consensus_params: &'a ConsensusParams,
 }
 
 impl<'a> HeaderVersion<'a> {
-	fn new(header: CanonHeader<'a>, height: u32, consensus_params: ConsensusParams) -> Self {
+	fn new(header: CanonHeader<'a>, height: u32, consensus_params: &'a ConsensusParams) -> Self {
 		HeaderVersion {
 			header: header,
 			height: height,
@@ -49,8 +55,8 @@ impl<'a> HeaderVersion<'a> {
 
 	fn check(&self) -> Result<(), Error> {
 		if (self.header.raw.version < 2 && self.height >= self.consensus_params.bip34_height) ||
-			(self.header.raw.version < 3 && self.height >= self.consensus_params.bip65_height) ||
-			(self.header.raw.version < 4 && self.height >= self.consensus_params.bip66_height) {
+			(self.header.raw.version < 3 && self.height >= self.consensus_params.bip66_height) ||
+			(self.header.raw.version < 4 && self.height >= self.consensus_params.bip65_height) {
 			Err(Error::OldVersionBlock)
 		} else {
 			Ok(())
@@ -60,25 +66,25 @@ impl<'a> HeaderVersion<'a> {
 
 pub struct HeaderWork<'a> {
 	header: CanonHeader<'a>,
-	store: &'a BlockHeaderProvider,
+	store: &'a dyn BlockHeaderProvider,
 	height: u32,
-	network: Magic,
+	consensus: &'a ConsensusParams,
 }
 
 impl<'a> HeaderWork<'a> {
-	fn new(header: CanonHeader<'a>, store: &'a BlockHeaderProvider, height: u32, network: Magic) -> Self {
+	fn new(header: CanonHeader<'a>, store: &'a dyn BlockHeaderProvider, height: u32, consensus: &'a ConsensusParams) -> Self {
 		HeaderWork {
 			header: header,
 			store: store,
 			height: height,
-			network: network,
+			consensus: consensus,
 		}
 	}
 
 	fn check(&self) -> Result<(), Error> {
 		let previous_header_hash = self.header.raw.previous_header_hash.clone();
 		let time = self.header.raw.time;
-		let work = work_required(previous_header_hash, time, self.height, self.store, self.network);
+		let work = work_required(previous_header_hash, time, self.height, self.store, self.consensus);
 		if work == self.header.raw.bits {
 			Ok(())
 		} else {
@@ -89,22 +95,21 @@ impl<'a> HeaderWork<'a> {
 
 pub struct HeaderMedianTimestamp<'a> {
 	header: CanonHeader<'a>,
-	store: &'a BlockHeaderProvider,
-	network: Magic,
+	store: &'a dyn BlockHeaderProvider,
+	active: bool,
 }
 
 impl<'a> HeaderMedianTimestamp<'a> {
-	fn new(header: CanonHeader<'a>, store: &'a BlockHeaderProvider, network: Magic) -> Self {
+	fn new(header: CanonHeader<'a>, store: &'a dyn BlockHeaderProvider, csv_active: bool) -> Self {
 		HeaderMedianTimestamp {
 			header: header,
 			store: store,
-			network: network,
+			active: csv_active,
 		}
 	}
 
 	fn check(&self) -> Result<(), Error> {
-		let median = median_timestamp(&self.header.raw, self.store, self.network);
-		if self.header.raw.time <= median {
+		if self.active && self.header.raw.time <= median_timestamp(&self.header.raw, self.store) {
 			Err(Error::Timestamp)
 		} else {
 			Ok(())

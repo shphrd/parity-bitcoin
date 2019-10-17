@@ -1,47 +1,22 @@
-use std::io;
 use hex::FromHex;
-use hash::H256;
-use ser::{
-	Deserializable, Reader, Error as ReaderError, deserialize,
-	Serializable, Stream
-};
-use merkle_root::merkle_root;
+use ser::{deserialize};
 use {BlockHeader, Transaction};
-use super::RepresentH256;
 
-#[derive(Debug, PartialEq, Clone)]
+#[cfg(any(test, feature = "test-helpers"))]
+use hash::H256;
+#[cfg(any(test, feature = "test-helpers"))]
+use merkle_root::merkle_root;
+
+#[derive(Debug, PartialEq, Clone, Serializable, Deserializable)]
 pub struct Block {
 	pub block_header: BlockHeader,
 	pub transactions: Vec<Transaction>,
 }
 
-impl Serializable for Block {
-	fn serialize(&self, stream: &mut Stream) {
-		stream
-			.append(&self.block_header)
-			.append_list(&self.transactions);
-	}
-}
-
-impl Deserializable for Block {
-	fn deserialize<T>(reader: &mut Reader<T>) -> Result<Self, ReaderError> where T: io::Read {
-		let result = Block {
-			block_header: try!(reader.read()),
-			transactions: try!(reader.read_list()),
-		};
-
-		Ok(result)
-	}
-}
-
 impl From<&'static str> for Block {
 	fn from(s: &'static str) -> Self {
-		deserialize(&s.from_hex().unwrap() as &[u8]).unwrap()
+		deserialize(&s.from_hex::<Vec<u8>>().unwrap() as &[u8]).unwrap()
 	}
-}
-
-impl RepresentH256 for Block {
-	fn h256(&self) -> H256 { self.hash() }
 }
 
 impl Block {
@@ -50,8 +25,23 @@ impl Block {
 	}
 
 	/// Returns block's merkle root.
+	#[cfg(any(test, feature = "test-helpers"))]
 	pub fn merkle_root(&self) -> H256 {
 		let hashes = self.transactions.iter().map(Transaction::hash).collect::<Vec<H256>>();
+		merkle_root(&hashes)
+	}
+
+	/// Returns block's witness merkle root.
+	#[cfg(any(test, feature = "test-helpers"))]
+	pub fn witness_merkle_root(&self) -> H256 {
+		let hashes = match self.transactions.split_first() {
+			None => vec![],
+			Some((_, rest)) => {
+				let mut hashes = vec![H256::from(0)];
+				hashes.extend(rest.iter().map(Transaction::witness_hash));
+				hashes
+			},
+		};
 		merkle_root(&hashes)
 	}
 
@@ -63,12 +53,9 @@ impl Block {
 		&self.block_header
 	}
 
+	#[cfg(any(test, feature = "test-helpers"))]
 	pub fn hash(&self) -> H256 {
 		self.block_header.hash()
-	}
-
-	pub fn is_final(&self, height: u32) -> bool {
-		self.transactions.iter().all(|t| t.is_final_in_block(height, self.block_header.time))
 	}
 }
 

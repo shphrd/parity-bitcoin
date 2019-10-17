@@ -5,14 +5,20 @@ authors = ["Nikolay Volf <nikvolf@gmail.com>"]
 
 [dependencies]
 time = "0.1"
-log = "0.3"
-rayon = "0.6"
+lazy_static = "1.0"
+log = "0.4"
+rayon = "1.0"
+parking_lot = "0.4"
 primitives = { path = "../primitives" }
 chain = { path = "../chain"  }
 serialization = { path = "../serialization" }
 script = { path = "../script" }
 network = { path = "../network" }
-db = { path = "../db" }
+storage = { path = "../storage" }
+bitcrypto = { path = "../crypto" }
 
 [dev-dependencies]
 test-data = { path = "../test-data" }
+db = { path = "../db" }
+assert_matches = "1.3.0"
+chain = { path = "../chain", features = ["test-helpers"] }

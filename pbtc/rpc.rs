@@ -1,17 +1,17 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use rpc_apis::{self, ApiSet};
-use ethcore_rpc::{Server, Error, start_http, MetaIoHandler, Compatibility, Remote};
-use network::Magic;
+use ethcore_rpc::{Server, start_http, MetaIoHandler, Compatibility, Remote};
+use network::Network;
 use std::io;
 use sync;
-use db;
+use storage;
 use p2p;
 
 pub struct Dependencies {
-	pub network: Magic,
+	pub network: Network,
 	pub local_sync_node: sync::LocalNodeRef,
-	pub storage: db::SharedStore,
+	pub storage: storage::SharedStore,
 	pub p2p_context: Arc<p2p::Context>,
 	pub remote: Remote,
 }
@@ -59,8 +59,8 @@ pub fn setup_http_rpc_server(
 	let server = setup_rpc_server(apis, deps);
 	let start_result = start_http(url, cors_domains, allowed_hosts, server);
 	match start_result {
-		Err(Error::Io(ref err)) if err.kind() == io::ErrorKind::AddrInUse => {
-			Err(format!("RPC address {} is already in use, make sure that another instance of an Ethereum client is not running or change the address using the --jsonrpc-port and --jsonrpc-interface options.", url))
+		Err(ref err) if err.kind() == io::ErrorKind::AddrInUse => {
+			Err(format!("RPC address {} is already in use, make sure that another instance of a Bitcoin node is not running or change the address using the --jsonrpc-port and --jsonrpc-interface options.", url))
 		},
 		Err(e) => Err(format!("RPC error: {:?}", e)),
 		Ok(server) => Ok(server),

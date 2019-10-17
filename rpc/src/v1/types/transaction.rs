@@ -1,7 +1,8 @@
 use std::fmt;
 use serde::{Serialize, Serializer, Deserialize, Deserializer};
 use serde::ser::SerializeMap;
-use super::address::Address;
+use keys::Address;
+use v1::types;
 use super::bytes::Bytes;
 use super::hash::H256;
 use super::script::ScriptType;
@@ -75,6 +76,7 @@ pub struct TransactionOutputScript {
 	#[serde(rename = "type")]
 	pub script_type: ScriptType,
 	/// Array of bitcoin addresses
+	#[serde(with = "types::address::vec")]
 	pub addresses: Vec<Address>,
 }
 
@@ -90,7 +92,8 @@ pub struct SignedTransactionInput {
 	/// Sequence number
 	pub sequence: u32,
 	/// Hex-encoded witness data (if any)
-	pub txinwitness: Vec<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub txinwitness: Option<Vec<Bytes>>,
 }
 
 /// Signed transaction output
@@ -109,7 +112,8 @@ pub struct SignedTransactionOutput {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Transaction {
 	/// Raw transaction
-	pub hex: RawTransaction,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub hex: Option<RawTransaction>,
 	/// The transaction id (same as provided)
 	pub txid: H256,
 	/// The transaction hash (differs from txid for witness transactions)
@@ -127,13 +131,17 @@ pub struct Transaction {
 	/// Transaction outputs
 	pub vout: Vec<SignedTransactionOutput>,
 	/// Hash of the block this transaction is included in
-	pub blockhash: H256,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub blockhash: Option<H256>,
 	/// Number of confirmations of this transaction
-	pub confirmations: u32,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub confirmations: Option<u32>,
 	/// The transaction time in seconds since epoch (Jan 1 1970 GMT)
-	pub time: u32,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub time: Option<u32>,
 	/// The block time in seconds since epoch (Jan 1 1970 GMT)
-	pub blocktime: u32,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub blocktime: Option<u32>,
 }
 
 /// Return value of `getrawtransaction` method
@@ -166,7 +174,7 @@ impl Serialize for TransactionOutputs {
 		for output in &self.outputs {
 			match output {
 				&TransactionOutput::Address(ref address_output) => {
-					state.serialize_entry(&address_output.address, &address_output.amount)?;
+					state.serialize_entry(&address_output.address.to_string(), &address_output.amount)?;
 				},
 				&TransactionOutput::ScriptData(ref script_output) => {
 					state.serialize_entry("data", &script_output.script_data)?;
@@ -177,31 +185,31 @@ impl Serialize for TransactionOutputs {
 	}
 }
 
-impl Deserialize for TransactionOutputs {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer {
-		use serde::de::{Visitor, MapVisitor};
+impl<'a> Deserialize<'a> for TransactionOutputs {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer<'a> {
+		use serde::de::{Visitor, MapAccess};
 
 		struct TransactionOutputsVisitor;
 
-		impl Visitor for TransactionOutputsVisitor {
+		impl<'b> Visitor<'b> for TransactionOutputsVisitor {
 			type Value = TransactionOutputs;
 
 			fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
 				formatter.write_str("a transaction output object")
 			}
 
-			fn visit_map<V>(self, mut visitor: V) -> Result<TransactionOutputs, V::Error> where V: MapVisitor {
-				let mut outputs: Vec<TransactionOutput> = Vec::with_capacity(visitor.size_hint().0);
+			fn visit_map<V>(self, mut visitor: V) -> Result<TransactionOutputs, V::Error> where V: MapAccess<'b> {
+				let mut outputs: Vec<TransactionOutput> = Vec::with_capacity(visitor.size_hint().unwrap_or(0));
 
-				while let Some(key) = try!(visitor.visit_key::<String>()) {
+				while let Some(key) = try!(visitor.next_key::<String>()) {
 					if &key == "data" {
-						let value: Bytes = try!(visitor.visit_value());
+						let value: Bytes = try!(visitor.next_value());
 						outputs.push(TransactionOutput::ScriptData(TransactionOutputWithScriptData {
 							script_data: value,
 						}));
 					} else {
-						let address = try!(Address::deserialize_from_string(&key, &"an address"));
-						let amount: f64 = try!(visitor.visit_value());
+						let address = types::address::AddressVisitor::default().visit_str(&key)?;
+						let amount: f64 = try!(visitor.next_value());
 						outputs.push(TransactionOutput::Address(TransactionOutputWithAddress {
 							address: address,
 							amount: amount,
@@ -215,7 +223,7 @@ impl Deserialize for TransactionOutputs {
 			}
 		}
 
-		deserializer.deserialize(TransactionOutputsVisitor)
+		deserializer.deserialize_any(TransactionOutputsVisitor)
 	}
 }
 
@@ -355,9 +363,9 @@ mod tests {
 				hex: Bytes::new(vec![1, 2, 3, 4]),
 			},
 			sequence: 123,
-			txinwitness: vec![],
+			txinwitness: None,
 		};
-		assert_eq!(serde_json::to_string(&txin).unwrap(), r#"{"txid":"4d00000000000000000000000000000000000000000000000000000000000000","vout":13,"script_sig":{"asm":"Hello, world!!!","hex":"01020304"},"sequence":123,"txinwitness":[]}"#);
+		assert_eq!(serde_json::to_string(&txin).unwrap(), r#"{"txid":"4d00000000000000000000000000000000000000000000000000000000000000","vout":13,"script_sig":{"asm":"Hello, world!!!","hex":"01020304"},"sequence":123}"#);
 	}
 
 	#[test]
@@ -370,10 +378,10 @@ mod tests {
 				hex: Bytes::new(vec![1, 2, 3, 4]),
 			},
 			sequence: 123,
-			txinwitness: vec![],
+			txinwitness: None,
 		};
 		assert_eq!(
-			serde_json::from_str::<SignedTransactionInput>(r#"{"txid":"4d00000000000000000000000000000000000000000000000000000000000000","vout":13,"script_sig":{"asm":"Hello, world!!!","hex":"01020304"},"sequence":123,"txinwitness":[]}"#).unwrap(),
+			serde_json::from_str::<SignedTransactionInput>(r#"{"txid":"4d00000000000000000000000000000000000000000000000000000000000000","vout":13,"script_sig":{"asm":"Hello, world!!!","hex":"01020304"},"sequence":123}"#).unwrap(),
 			txin);
 	}
 
@@ -414,7 +422,7 @@ mod tests {
 	#[test]
 	fn transaction_serialize() {
 		let tx = Transaction {
-			hex: "DEADBEEF".into(),
+			hex: Some("DEADBEEF".into()),
 			txid: H256::from(4),
 			hash: H256::from(5),
 			size: 33,
@@ -423,10 +431,10 @@ mod tests {
 			locktime: 66,
 			vin: vec![],
 			vout: vec![],
-			blockhash: H256::from(6),
-			confirmations: 77,
-			time: 88,
-			blocktime: 99,
+			blockhash: Some(H256::from(6)),
+			confirmations: Some(77),
+			time: Some(88),
+			blocktime: Some(99),
 		};
 		assert_eq!(serde_json::to_string(&tx).unwrap(), r#"{"hex":"deadbeef","txid":"0400000000000000000000000000000000000000000000000000000000000000","hash":"0500000000000000000000000000000000000000000000000000000000000000","size":33,"vsize":44,"version":55,"locktime":66,"vin":[],"vout":[],"blockhash":"0600000000000000000000000000000000000000000000000000000000000000","confirmations":77,"time":88,"blocktime":99}"#);
 	}
@@ -434,7 +442,7 @@ mod tests {
 	#[test]
 	fn transaction_deserialize() {
 		let tx = Transaction {
-			hex: "DEADBEEF".into(),
+			hex: Some("DEADBEEF".into()),
 			txid: H256::from(4),
 			hash: H256::from(5),
 			size: 33,
@@ -443,10 +451,10 @@ mod tests {
 			locktime: 66,
 			vin: vec![],
 			vout: vec![],
-			blockhash: H256::from(6),
-			confirmations: 77,
-			time: 88,
-			blocktime: 99,
+			blockhash: Some(H256::from(6)),
+			confirmations: Some(77),
+			time: Some(88),
+			blocktime: Some(99),
 		};
 		assert_eq!(
 			serde_json::from_str::<Transaction>(r#"{"hex":"deadbeef","txid":"0400000000000000000000000000000000000000000000000000000000000000","hash":"0500000000000000000000000000000000000000000000000000000000000000","size":33,"vsize":44,"version":55,"locktime":66,"vin":[],"vout":[],"blockhash":"0600000000000000000000000000000000000000000000000000000000000000","confirmations":77,"time":88,"blocktime":99}"#).unwrap(),

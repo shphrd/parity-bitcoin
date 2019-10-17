@@ -1,6 +1,6 @@
-use chain::{IndexedTransaction, IndexedBlock};
+use chain::{IndexedTransaction, IndexedBlock, IndexedBlockHeader};
 use message::types;
-use p2p::{InboundSyncConnection, InboundSyncConnectionRef};
+use p2p::{InboundSyncConnection, InboundSyncConnectionRef, InboundSyncConnectionStateRef};
 use types::{PeersRef, LocalNodeRef, PeerIndex, RequestId};
 use utils::KnownHashType;
 
@@ -31,8 +31,12 @@ impl InboundConnection {
 }
 
 impl InboundSyncConnection for InboundConnection {
-	fn start_sync_session(&self, version: types::Version) {
-		self.node.on_connect(self.peer_index, version);
+	fn sync_state(&self) -> InboundSyncConnectionStateRef {
+		self.node.sync_state()
+	}
+
+	fn start_sync_session(&self, peer_name: String, version: types::Version) {
+		self.node.on_connect(self.peer_index, peer_name, version);
 	}
 
 	fn close_session(&self) {
@@ -77,13 +81,13 @@ impl InboundSyncConnection for InboundConnection {
 	}
 
 	fn on_transaction(&self, message: types::Tx) {
-		let tx: IndexedTransaction = message.transaction.into();
+		let tx = IndexedTransaction::from_raw(message.transaction);
 		self.peers.hash_known_as(self.peer_index, tx.hash.clone(), KnownHashType::Transaction);
 		self.node.on_transaction(self.peer_index, tx);
 	}
 
 	fn on_block(&self, message: types::Block) {
-		let block: IndexedBlock = message.block.into();
+		let block = IndexedBlock::from_raw(message.block);
 		self.peers.hash_known_as(self.peer_index, block.hash().clone(), KnownHashType::Block);
 		self.node.on_block(self.peer_index, block);
 	}
@@ -99,7 +103,8 @@ impl InboundSyncConnection for InboundConnection {
 			return;
 		}
 
-		self.node.on_headers(self.peer_index, message);
+		let headers = message.headers.into_iter().map(IndexedBlockHeader::from_raw).collect();
+		self.node.on_headers(self.peer_index, headers);
 	}
 
 	fn on_mempool(&self, message: types::MemPool) {
@@ -196,6 +201,8 @@ pub mod tests {
 		fn send_getheaders(&self, _message: &types::GetHeaders) { *self.messages.lock().entry("getheaders".to_owned()).or_insert(0) += 1; }
 		fn send_transaction(&self, _message: &types::Tx) { *self.messages.lock().entry("transaction".to_owned()).or_insert(0) += 1; }
 		fn send_block(&self, _message: &types::Block) { *self.messages.lock().entry("block".to_owned()).or_insert(0) += 1; }
+		fn send_witness_transaction(&self, _message: &types::Tx) { *self.messages.lock().entry("witness_transaction".to_owned()).or_insert(0) += 1; }
+		fn send_witness_block(&self, _message: &types::Block) { *self.messages.lock().entry("witness_block".to_owned()).or_insert(0) += 1; }
 		fn send_headers(&self, _message: &types::Headers) { *self.messages.lock().entry("headers".to_owned()).or_insert(0) += 1; }
 		fn respond_headers(&self, _message: &types::Headers, _id: RequestId) { *self.messages.lock().entry("headers".to_owned()).or_insert(0) += 1; }
 		fn send_mempool(&self, _message: &types::MemPool) { *self.messages.lock().entry("mempool".to_owned()).or_insert(0) += 1; }

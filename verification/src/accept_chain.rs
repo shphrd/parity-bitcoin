@@ -1,12 +1,16 @@
 use rayon::prelude::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator};
-use db::Store;
-use network::Magic;
+use storage::{
+	DuplexTransactionOutputProvider, TransactionOutputProvider, TransactionMetaProvider,
+	BlockHeaderProvider,
+};
+use network::ConsensusParams;
 use error::Error;
 use canon::CanonBlock;
 use accept_block::BlockAcceptor;
 use accept_header::HeaderAcceptor;
 use accept_transaction::TransactionAcceptor;
-use duplex_store::DuplexTransactionOutputProvider;
+use deployments::BlockDeployments;
+use VerificationLevel;
 
 pub struct ChainAcceptor<'a> {
 	pub block: BlockAcceptor<'a>,
@@ -15,24 +19,46 @@ pub struct ChainAcceptor<'a> {
 }
 
 impl<'a> ChainAcceptor<'a> {
-	pub fn new(store: &'a Store, network: Magic, block: CanonBlock<'a>, height: u32) -> Self {
+	pub fn new(
+		tx_out_provider: &'a dyn TransactionOutputProvider,
+		tx_meta_provider: &'a dyn TransactionMetaProvider,
+		header_provider: &'a dyn BlockHeaderProvider,
+		consensus: &'a ConsensusParams,
+		verification_level: VerificationLevel,
+		block: CanonBlock<'a>,
+		height: u32,
+		median_time_past: u32,
+		deployments: &'a BlockDeployments,
+	) -> Self {
 		trace!(target: "verification", "Block verification {}", block.hash().to_reversed_str());
-		let output_store = DuplexTransactionOutputProvider::new(store.as_transaction_output_provider(), block.raw());
+		let output_store = DuplexTransactionOutputProvider::new(tx_out_provider, block.raw());
+
 		ChainAcceptor {
-			block: BlockAcceptor::new(store.as_transaction_output_provider(), network, block, height),
-			header: HeaderAcceptor::new(store.as_block_header_provider(), network, block.header(), height),
+			block: BlockAcceptor::new(
+				tx_out_provider,
+				consensus,
+				block,
+				height,
+				median_time_past,
+				deployments,
+				header_provider,
+			),
+			header: HeaderAcceptor::new(header_provider, consensus, block.header(), height, deployments),
 			transactions: block.transactions()
 				.into_iter()
 				.enumerate()
 				.map(|(tx_index, tx)| TransactionAcceptor::new(
-						store.as_transaction_meta_provider(),
+						tx_meta_provider,
 						output_store,
-						network,
+						consensus,
 						tx,
+						verification_level,
 						block.hash(),
 						height,
 						block.header.raw.time,
-						tx_index
+						median_time_past,
+						tx_index,
+						deployments,
 				))
 				.collect(),
 		}

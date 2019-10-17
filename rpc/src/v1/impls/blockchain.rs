@@ -4,17 +4,17 @@ use v1::types::{GetTxOutResponse, TransactionOutputScript};
 use v1::types::GetTxOutSetInfoResponse;
 use v1::types::H256;
 use v1::types::U256;
-use v1::types::Address;
+use keys::{self, Address};
 use v1::helpers::errors::{block_not_found, block_at_height_not_found, transaction_not_found,
 	transaction_output_not_found, transaction_of_side_branch};
 use jsonrpc_macros::Trailing;
 use jsonrpc_core::Error;
-use {db, chain};
+use storage;
 use global_script::Script;
 use chain::OutPoint;
 use verification;
 use ser::serialize;
-use network::Magic;
+use network::Network;
 use primitives::hash::H256 as GlobalH256;
 
 pub struct BlockChainClient<T: BlockChainClientCoreApi> {
@@ -23,6 +23,7 @@ pub struct BlockChainClient<T: BlockChainClientCoreApi> {
 
 pub trait BlockChainClientCoreApi: Send + Sync + 'static {
 	fn best_block_hash(&self) -> GlobalH256;
+	fn block_count(&self) -> u32;
 	fn block_hash(&self, height: u32) -> Option<GlobalH256>;
 	fn difficulty(&self) -> f64;
 	fn raw_block(&self, hash: GlobalH256) -> Option<RawBlock>;
@@ -31,12 +32,12 @@ pub trait BlockChainClientCoreApi: Send + Sync + 'static {
 }
 
 pub struct BlockChainClientCore {
-	network: Magic,
-	storage: db::SharedStore,
+	network: Network,
+	storage: storage::SharedStore,
 }
 
 impl BlockChainClientCore {
-	pub fn new(network: Magic, storage: db::SharedStore) -> Self {
+	pub fn new(network: Network, storage: storage::SharedStore) -> Self {
 
 		BlockChainClientCore {
 			network: network,
@@ -50,6 +51,10 @@ impl BlockChainClientCoreApi for BlockChainClientCore {
 		self.storage.best_block().hash
 	}
 
+	fn block_count(&self) -> u32 {
+		self.storage.best_block().number
+	}
+
 	fn block_hash(&self, height: u32) -> Option<GlobalH256> {
 		self.storage.block_hash(height)
 	}
@@ -61,25 +66,22 @@ impl BlockChainClientCoreApi for BlockChainClientCore {
 	fn raw_block(&self, hash: GlobalH256) -> Option<RawBlock> {
 		self.storage.block(hash.into())
 			.map(|block| {
-				serialize(&block).into()
+				serialize(&block.to_raw_block()).into()
 			})
 	}
 
 	fn verbose_block(&self, hash: GlobalH256) -> Option<VerboseBlock> {
 		self.storage.block(hash.into())
 			.map(|block| {
-				let block: chain::IndexedBlock = block.into();
 				let height = self.storage.block_number(block.hash());
 				let confirmations = match height {
 					Some(block_number) => (self.storage.best_block().number - block_number + 1) as i64,
 					None => -1,
 				};
 				let block_size = block.size();
-				// TODO: use real network
 				let median_time = verification::median_timestamp(
 					&block.header.raw,
-					self.storage.as_block_header_provider(),
-					Magic::Mainnet,
+					self.storage.as_block_header_provider()
 				);
 
 				VerboseBlock {
@@ -112,7 +114,7 @@ impl BlockChainClientCoreApi for BlockChainClientCore {
 			None => return Err(transaction_not_found(prev_out.hash)),
 		};
 
-		if prev_out.index >= transaction.outputs.len() as u32 {
+		if prev_out.index >= transaction.raw.outputs.len() as u32 {
 			return Err(transaction_output_not_found(prev_out));
 		}
 
@@ -134,24 +136,33 @@ impl BlockChainClientCoreApi for BlockChainClientCore {
 			return Err(transaction_not_found(prev_out.hash));
 		}
 
-		let ref script_bytes = transaction.outputs[prev_out.index as usize].script_pubkey;
+		let ref script_bytes = transaction.raw.outputs[prev_out.index as usize].script_pubkey;
 		let script: Script = script_bytes.clone().into();
 		let script_asm = format!("{}", script);
 		let script_addresses = script.extract_destinations().unwrap_or(vec![]);
 
 		Ok(GetTxOutResponse {
-			bestblock: block_header.hash().into(),
+			bestblock: block_header.hash.into(),
 			confirmations: best_block.number - meta.height() + 1,
-			value: 0.00000001f64 * (transaction.outputs[prev_out.index as usize].value as f64),
+			value: 0.00000001f64 * (transaction.raw.outputs[prev_out.index as usize].value as f64),
 			script: TransactionOutputScript {
 				asm: script_asm,
 				hex: script_bytes.clone().into(),
 				req_sigs: script.num_signatures_required() as u32,
 				script_type: script.script_type().into(),
-				addresses: script_addresses.into_iter().map(|a| Address::new(self.network, a)).collect(),
+				addresses: script_addresses.into_iter().map(|a| Address {
+					network: match self.network {
+						Network::Mainnet => keys::Network::Mainnet,
+						// there's no correct choices for Regtests && Other networks
+						// => let's just make Testnet key
+						_ => keys::Network::Testnet,
+					},
+					hash: a.hash,
+					kind: a.kind,
+				}).collect(),
 			},
-			version: transaction.version,
-			coinbase: transaction.is_coinbase(),
+			version: transaction.raw.version,
+			coinbase: transaction.raw.is_coinbase(),
 		})
 	}
 }
@@ -169,6 +180,10 @@ impl<T> BlockChain for BlockChainClient<T> where T: BlockChainClientCoreApi {
 		Ok(self.core.best_block_hash().reversed().into())
 	}
 
+    fn block_count(&self) -> Result<u32, Error> {
+        Ok(self.core.block_count())
+    }
+
 	fn block_hash(&self, height: u32) -> Result<H256, Error> {
 		self.core.block_hash(height)
 			.map(|h| h.reversed().into())
@@ -181,7 +196,7 @@ impl<T> BlockChain for BlockChainClient<T> where T: BlockChainClientCoreApi {
 
 	fn block(&self, hash: H256, verbose: Trailing<bool>) -> Result<GetBlockResponse, Error> {
 		let global_hash: GlobalH256 = hash.clone().into();
-		if verbose.0 {
+		if verbose.unwrap_or_default() {
 			let verbose_block = self.core.verbose_block(global_hash.reversed());
 			if let Some(mut verbose_block) = verbose_block {
 				verbose_block.previousblockhash = verbose_block.previousblockhash.map(|h| h.reversed());
@@ -233,7 +248,7 @@ pub mod tests {
 	use v1::types::H256;
 	use v1::types::ScriptType;
 	use chain::OutPoint;
-	use network::Magic;
+	use network::Network;
 	use super::*;
 
 	#[derive(Default)]
@@ -244,6 +259,10 @@ pub mod tests {
 	impl BlockChainClientCoreApi for SuccessBlockChainClientCore {
 		fn best_block_hash(&self) -> GlobalH256 {
 			test_data::genesis().hash()
+		}
+
+		fn block_count(&self) -> u32 {
+			1
 		}
 
 		fn block_hash(&self, _height: u32) -> Option<GlobalH256> {
@@ -308,6 +327,10 @@ pub mod tests {
 			test_data::genesis().hash()
 		}
 
+		fn block_count(&self) -> u32 {
+			1
+		}
+
 		fn block_hash(&self, _height: u32) -> Option<GlobalH256> {
 			None
 		}
@@ -346,6 +369,23 @@ pub mod tests {
 		// direct hash is 6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000
 		// but client expects reverse hash
 		assert_eq!(&sample, r#"{"jsonrpc":"2.0","result":"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f","id":1}"#);
+	}
+
+	#[test]
+	fn block_count_success() {
+		let client = BlockChainClient::new(SuccessBlockChainClientCore::default());
+		let mut handler = IoHandler::new();
+		handler.extend_with(client.to_delegate());
+
+		let sample = handler.handle_request_sync(&(r#"
+			{
+				"jsonrpc": "2.0",
+				"method": "getblockcount",
+				"params": [],
+				"id": 1
+			}"#)).unwrap();
+
+		assert_eq!(&sample, r#"{"jsonrpc":"2.0","result":1,"id":1}"#);
 	}
 
 	#[test]
@@ -411,7 +451,7 @@ pub mod tests {
 			]
 		));
 
-		let core = BlockChainClientCore::new(Magic::Mainnet, storage);
+		let core = BlockChainClientCore::new(Network::Mainnet, storage);
 
 		// get info on block #1:
 		// https://blockexplorer.com/block/00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048
@@ -548,7 +588,7 @@ pub mod tests {
 	#[test]
 	fn verbose_transaction_out_contents() {
 		let storage = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
-		let core = BlockChainClientCore::new(Magic::Mainnet, storage);
+		let core = BlockChainClientCore::new(Network::Mainnet, storage);
 
 		// get info on tx from genesis block:
 		// https://blockchain.info/ru/tx/4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b

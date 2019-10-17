@@ -99,6 +99,11 @@ impl Script {
 		self.data.clone()
 	}
 
+	/// Is empty script
+	pub fn is_empty(&self) -> bool {
+		self.data.len() == 0
+	}
+
 	/// Extra-fast test for pay-to-public-key-hash (P2PKH) scripts.
 	pub fn is_pay_to_public_key_hash(&self) -> bool {
 		self.data.len() == 25 &&
@@ -137,6 +142,20 @@ impl Script {
 		self.data.len() == 22 &&
 			self.data[0] == Opcode::OP_0 as u8 &&
 			self.data[1] == Opcode::OP_PUSHBYTES_20 as u8
+	}
+
+	/// Parse witness program. Returns Some(witness program version, code) or None if not a witness program.
+	pub fn parse_witness_program(&self) -> Option<(u8, &[u8])> {
+		if self.data.len() < 4 || self.data.len() > 42 || self.data.len() != self.data[1] as usize + 2 {
+			return None;
+		}
+		let witness_version = match Opcode::from_u8(self.data[0]) {
+			Some(Opcode::OP_0) => 0,
+			Some(x) if x >= Opcode::OP_1 && x <= Opcode::OP_16 => (x as u8) - (Opcode::OP_1 as u8) + 1,
+			_ => return None,
+		};
+		let witness_program = &self.data[2..];
+		Some((witness_version, witness_program))
 	}
 
 	/// Extra-fast test for pay-to-witness-script-hash scripts.
@@ -231,7 +250,7 @@ impl Script {
 	}
 
 	pub fn get_instruction(&self, position: usize) -> Result<Instruction, Error> {
-		let opcode = try!(self.get_opcode(position));
+		let opcode = self.get_opcode(position)?;
 		let instruction = match opcode {
 			Opcode::OP_PUSHDATA1 |
 			Opcode::OP_PUSHDATA2 |
@@ -242,9 +261,9 @@ impl Script {
 					_ => 4,
 				};
 
-				let slice = try!(self.take(position + 1, len));
-				let n = try!(read_usize(slice, len));
-				let bytes = try!(self.take(position + 1 + len, n));
+				let slice = self.take(position + 1, len)?;
+				let n = read_usize(slice, len)?;
+				let bytes = self.take(position + 1 + len, n)?;
 				Instruction {
 					opcode: opcode,
 					step: len + n + 1,
@@ -252,7 +271,7 @@ impl Script {
 				}
 			},
 			o if o <= Opcode::OP_PUSHBYTES_75 => {
-				let bytes = try!(self.take(position + 1, opcode as usize));
+				let bytes = self.take(position + 1, opcode as usize)?;
 				Instruction {
 					opcode: o,
 					step: opcode as usize + 1,
@@ -331,6 +350,10 @@ impl Script {
 			ScriptType::Multisig
 		} else if self.is_null_data_script() {
 			ScriptType::NullData
+		} else if self.is_pay_to_witness_key_hash() {
+			ScriptType::WitnessKey
+		} else if self.is_pay_to_witness_script_hash() {
+			ScriptType::WitnessScript
 		} else {
 			ScriptType::NonStandard
 		}
@@ -344,7 +367,7 @@ impl Script {
 		Opcodes { position: 0, script: self }
 	}
 
-	pub fn sigops_count(&self, serialized_script: bool) -> usize {
+	pub fn sigops_count(&self, checkdatasig_active: bool, serialized_script: bool) -> usize {
 		let mut last_opcode = Opcode::OP_0;
 		let mut total = 0;
 		for opcode in self.opcodes() {
@@ -356,6 +379,9 @@ impl Script {
 
 			match opcode {
 				Opcode::OP_CHECKSIG | Opcode::OP_CHECKSIGVERIFY => {
+					total += 1;
+				},
+				Opcode::OP_CHECKDATASIG | Opcode::OP_CHECKDATASIGVERIFY if checkdatasig_active => {
 					total += 1;
 				},
 				Opcode::OP_CHECKMULTISIG | Opcode::OP_CHECKMULTISIGVERIFY => {
@@ -413,7 +439,7 @@ impl Script {
 				while pc < self.len() - 2 {
 					let instruction = self.get_instruction(pc).expect("this method depends on previous check in script_type()");
 					let data = instruction.data.expect("this method depends on previous check in script_type()");
-					let address = try!(Public::from_slice(data)).address_hash();
+					let address = Public::from_slice(data)?.address_hash();
 					addresses.push(ScriptAddress::new_p2pkh(address));
 					pc += instruction.step;
 				}
@@ -431,7 +457,7 @@ impl Script {
 		}
 	}
 
-	pub fn pay_to_script_hash_sigops(&self, prev_out: &Script) -> usize {
+	pub fn pay_to_script_hash_sigops(&self, checkdatasig_active: bool, prev_out: &Script) -> usize {
 		if !prev_out.is_pay_to_script_hash() {
 			return 0;
 		}
@@ -447,7 +473,7 @@ impl Script {
 			.to_vec()
 			.into();
 
-		script.sigops_count(true)
+		script.sigops_count(checkdatasig_active, true)
 	}
 }
 
@@ -536,8 +562,8 @@ impl fmt::Display for Script {
 			};
 
 			match instruction.data {
-				Some(data) => try!(writeln!(f, "{:?} 0x{:?}", instruction.opcode, Bytes::from(data.to_vec()))),
-				None => try!(writeln!(f, "{:?}", instruction.opcode)),
+				Some(data) => writeln!(f, "{:?} 0x{:?}", instruction.opcode, Bytes::from(data.to_vec()))?,
+				None => writeln!(f, "{:?}", instruction.opcode)?,
 			}
 
 			pc += instruction.step;
@@ -545,6 +571,20 @@ impl fmt::Display for Script {
 
 		Ok(())
 	}
+}
+
+pub type ScriptWitness = Vec<Bytes>;
+
+/// Passed bytes array is a commitment script?
+/// https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#Commitment_structure
+pub fn is_witness_commitment_script(script: &[u8]) -> bool {
+	script.len() >= 38 &&
+		script[0] == Opcode::OP_RETURN as u8 &&
+		script[1] == 0x24 &&
+		script[2] == 0xAA &&
+		script[3] == 0x21 &&
+		script[4] == 0xA9 &&
+		script[5] == 0xED
 }
 
 #[cfg(test)]
@@ -632,11 +672,11 @@ OP_ADD
 
 	#[test]
 	fn test_sigops_count() {
-		assert_eq!(1usize, Script::from("76a914aab76ba4877d696590d94ea3e02948b55294815188ac").sigops_count(false));
-		assert_eq!(2usize, Script::from("522102004525da5546e7603eefad5ef971e82f7dad2272b34e6b3036ab1fe3d299c22f21037d7f2227e6c646707d1c61ecceb821794124363a2cf2c1d2a6f28cf01e5d6abe52ae").sigops_count(true));
-		assert_eq!(20usize, Script::from("522102004525da5546e7603eefad5ef971e82f7dad2272b34e6b3036ab1fe3d299c22f21037d7f2227e6c646707d1c61ecceb821794124363a2cf2c1d2a6f28cf01e5d6abe52ae").sigops_count(false));
-		assert_eq!(0usize, Script::from("a9146262b64aec1f4a4c1d21b32e9c2811dd2171fd7587").sigops_count(false));
-		assert_eq!(1usize, Script::from("4104ae1a62fe09c5f51b13905f07f06b99a2f7159b2225f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac").sigops_count(false));
+		assert_eq!(1usize, Script::from("76a914aab76ba4877d696590d94ea3e02948b55294815188ac").sigops_count(false, false));
+		assert_eq!(2usize, Script::from("522102004525da5546e7603eefad5ef971e82f7dad2272b34e6b3036ab1fe3d299c22f21037d7f2227e6c646707d1c61ecceb821794124363a2cf2c1d2a6f28cf01e5d6abe52ae").sigops_count(false, true));
+		assert_eq!(20usize, Script::from("522102004525da5546e7603eefad5ef971e82f7dad2272b34e6b3036ab1fe3d299c22f21037d7f2227e6c646707d1c61ecceb821794124363a2cf2c1d2a6f28cf01e5d6abe52ae").sigops_count(false, false));
+		assert_eq!(0usize, Script::from("a9146262b64aec1f4a4c1d21b32e9c2811dd2171fd7587").sigops_count(false, false));
+		assert_eq!(1usize, Script::from("4104ae1a62fe09c5f51b13905f07f06b99a2f7159b2225f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac").sigops_count(false, false));
 	}
 
 	#[test]
@@ -651,7 +691,7 @@ OP_ADD
 		script[max_block_sigops - block_sigops + 3] = (overmax >> 16) as u8;
 		script[max_block_sigops - block_sigops + 4] = (overmax >> 24) as u8;
 		let script: Script = script.into();
-		assert_eq!(script.sigops_count(false), 20001);
+		assert_eq!(script.sigops_count(false, false), 20001);
 	}
 
 	#[test]
@@ -665,7 +705,7 @@ OP_ADD
 		script[max_block_sigops - block_sigops + 4] = 0xff;
 		script[max_block_sigops - block_sigops + 5] = 0xff;
 		let script: Script = script.into();
-		assert_eq!(script.sigops_count(false), 20001);
+		assert_eq!(script.sigops_count(false, false), 20001);
 	}
 
 	#[test]
@@ -764,5 +804,15 @@ OP_ADD
 			.into_script();
 		assert_eq!(script.script_type(), ScriptType::ScriptHash);
 		assert_eq!(script.num_signatures_required(), 1);
+	}
+
+	#[test]
+	fn test_num_signatures_with_checkdatasig() {
+		let script = Builder::default().push_opcode(Opcode::OP_CHECKDATASIG).into_script();
+		assert_eq!(script.sigops_count(false, false), 0);
+		assert_eq!(script.sigops_count(true, false), 1);
+		let script = Builder::default().push_opcode(Opcode::OP_CHECKDATASIGVERIFY).into_script();
+		assert_eq!(script.sigops_count(false, false), 0);
+		assert_eq!(script.sigops_count(true, false), 1);
 	}
 }

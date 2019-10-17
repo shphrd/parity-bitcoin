@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use chain::{Transaction, TransactionOutput, OutPoint};
-use db::TransactionOutputProvider;
+use storage::TransactionOutputProvider;
 use miner::{DoubleSpendCheckResult, HashedOutPoint, NonFinalDoubleSpendSet};
 use verification::TransactionError;
 use super::super::types::{MemoryPoolRef, StorageRef};
@@ -96,8 +96,9 @@ mod tests {
 	use std::sync::Arc;
 	use parking_lot::RwLock;
 	use chain::OutPoint;
-	use db::{TransactionOutputProvider, BlockChainDatabase};
-	use miner::MemoryPool;
+	use storage::TransactionOutputProvider;
+	use db::BlockChainDatabase;
+	use miner::{MemoryPool, NonZeroFeeCalculator};
 	use super::MemoryPoolTransactionOutputProvider;
 
 	#[test]
@@ -112,9 +113,9 @@ mod tests {
 		let storage = Arc::new(BlockChainDatabase::init_test_chain(vec![test_data::genesis().into()]));
 		let memory_pool = Arc::new(RwLock::new(MemoryPool::new()));
 		{
-			memory_pool.write().insert_verified(dchain.at(0).into());
-			memory_pool.write().insert_verified(dchain.at(1).into());
-			memory_pool.write().insert_verified(dchain.at(2).into());
+			memory_pool.write().insert_verified(dchain.at(0).into(), &NonZeroFeeCalculator);
+			memory_pool.write().insert_verified(dchain.at(1).into(), &NonZeroFeeCalculator);
+			memory_pool.write().insert_verified(dchain.at(2).into(), &NonZeroFeeCalculator);
 		}
 
 		// when inserting t3:

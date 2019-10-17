@@ -2,16 +2,16 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use std::fs::create_dir_all;
 use app_dirs::{app_dir, AppDataType};
-use {db, APP_INFO};
+use {storage, APP_INFO};
+use db;
 use config::Config;
-use chain::IndexedBlock;
 
-pub fn open_db(cfg: &Config) -> db::SharedStore {
-	let db_path = match cfg.data_dir {
+pub fn open_db(data_dir: &Option<String>, db_cache: usize) -> storage::SharedStore {
+	let db_path = match *data_dir {
 		Some(ref data_dir) => custom_path(&data_dir, "db"),
 		None => app_dir(AppDataType::UserData, &APP_INFO, "db").expect("Failed to get app dir"),
 	};
-	Arc::new(db::BlockChainDatabase::open_at_path(db_path, cfg.db_cache).expect("Failed to open database"))
+	Arc::new(db::BlockChainDatabase::open_at_path(db_path, db_cache).expect("Failed to open database"))
 }
 
 pub fn node_table_path(cfg: &Config) -> PathBuf {
@@ -23,15 +23,16 @@ pub fn node_table_path(cfg: &Config) -> PathBuf {
 	node_table
 }
 
-pub fn init_db(cfg: &Config, db: &db::SharedStore) -> Result<(), String> {
+pub fn init_db(cfg: &Config) -> Result<(), String> {
 	// insert genesis block if db is empty
-	let genesis_block: IndexedBlock = cfg.magic.genesis_block().into();
-	match db.block_hash(0) {
+	let genesis_block = cfg.network.genesis_block();
+	match cfg.db.block_hash(0) {
 		Some(ref db_genesis_block_hash) if db_genesis_block_hash != genesis_block.hash() => Err("Trying to open database with incompatible genesis block".into()),
 		Some(_) => Ok(()),
 		None => {
-			db.insert(&genesis_block).expect("Failed to insert genesis block to the database");
-			db.canonize(genesis_block.hash()).expect("Failed to canonize genesis block");
+			let hash = genesis_block.hash().clone();
+			cfg.db.insert(genesis_block).expect("Failed to insert genesis block to the database");
+			cfg.db.canonize(&hash).expect("Failed to canonize genesis block");
 			Ok(())
 		}
 	}

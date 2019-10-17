@@ -53,18 +53,54 @@ pub struct VerificationFlags {
 	/// Verify CHECKLOCKTIMEVERIFY
 	///
 	/// See BIP65 for details.
-	pub verify_clocktimeverify: bool,
+	pub verify_locktime: bool,
 
 	/// support CHECKSEQUENCEVERIFY opcode
 	///
 	/// See BIP112 for details
-	pub verify_checksequenceverify: bool,
+	pub verify_checksequence: bool,
 
 	/// Support segregated witness
 	pub verify_witness: bool,
 
 	/// Making v1-v16 witness program non-standard
 	pub verify_discourage_upgradable_witness_program: bool,
+
+	/// Support OP_CAT opcode
+	pub verify_concat: bool,
+
+	/// Support OP_SPLIT opcode
+	///
+	/// This opcode replaces OP_SUBSTR => enabling both OP_SPLIT && OP_SUBSTR would be an error
+	pub verify_split: bool,
+
+	/// Support OP_AND opcode
+	pub verify_and: bool,
+
+	/// Support OP_OR opcode
+	pub verify_or: bool,
+
+	/// Support OP_XOR opcode
+	pub verify_xor: bool,
+
+	/// Support OP_DIV opcode
+	pub verify_div: bool,
+
+	/// Support OP_MOD opcode
+	pub verify_mod: bool,
+
+	/// Support OP_BIN2NUM opcode
+	///
+	/// This opcode replaces OP_RIGHT => enabling both OP_BIN2NUM && OP_RIGHT would be an error
+	pub verify_bin2num: bool,
+
+	/// Support OP_NUM2BIN opcode
+	///
+	/// This opcode replaces OP_LEFT => enabling both OP_NUM2BIN && OP_LEFT would be an error
+	pub verify_num2bin: bool,
+
+	/// Support OP_CHECKDATASIG and OP_CHECKDATASIGVERIFY opcodes.
+	pub verify_checkdatasig: bool,
 }
 
 impl VerificationFlags {
@@ -73,8 +109,18 @@ impl VerificationFlags {
 		self
 	}
 
-	pub fn verify_clocktimeverify(mut self, value: bool) -> Self {
-		self.verify_clocktimeverify = value;
+	pub fn verify_strictenc(mut self, value: bool) -> Self {
+		self.verify_strictenc = value;
+		self
+	}
+
+	pub fn verify_locktime(mut self, value: bool) -> Self {
+		self.verify_locktime = value;
+		self
+	}
+
+	pub fn verify_checksequence(mut self, value: bool) -> Self {
+		self.verify_checksequence = value;
 		self
 	}
 
@@ -82,5 +128,79 @@ impl VerificationFlags {
 		self.verify_dersig = value;
 		self
 	}
-}
 
+	pub fn verify_witness(mut self, value: bool) -> Self {
+		self.verify_witness = value;
+		self
+	}
+
+	pub fn verify_nulldummy(mut self, value: bool) -> Self {
+		self.verify_nulldummy = value;
+		self
+	}
+
+	pub fn verify_sigpushonly(mut self, value: bool) -> Self {
+		self.verify_sigpushonly = value;
+		self
+	}
+
+	pub fn verify_cleanstack(mut self, value: bool) -> Self {
+		self.verify_cleanstack = value;
+		self
+	}
+
+	pub fn verify_discourage_upgradable_witness_program(mut self, value: bool) -> Self {
+		self.verify_discourage_upgradable_witness_program = value;
+		self
+	}
+
+	pub fn verify_concat(mut self, value: bool) -> Self {
+		self.verify_concat = value;
+		self
+	}
+
+	pub fn verify_split(mut self, value: bool) -> Self {
+		self.verify_split = value;
+		self
+	}
+
+	pub fn verify_and(mut self, value: bool) -> Self {
+		self.verify_and = value;
+		self
+	}
+
+	pub fn verify_or(mut self, value: bool) -> Self {
+		self.verify_or = value;
+		self
+	}
+
+	pub fn verify_xor(mut self, value: bool) -> Self {
+		self.verify_xor = value;
+		self
+	}
+
+	pub fn verify_div(mut self, value: bool) -> Self {
+		self.verify_div = value;
+		self
+	}
+
+	pub fn verify_mod(mut self, value: bool) -> Self {
+		self.verify_mod = value;
+		self
+	}
+
+	pub fn verify_bin2num(mut self, value: bool) -> Self {
+		self.verify_bin2num = value;
+		self
+	}
+
+	pub fn verify_num2bin(mut self, value: bool) -> Self {
+		self.verify_num2bin = value;
+		self
+	}
+
+	pub fn verify_checkdatasig(mut self, value: bool) -> Self {
+		self.verify_checkdatasig = value;
+		self
+	}
+}

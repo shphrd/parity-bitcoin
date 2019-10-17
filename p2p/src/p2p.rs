@@ -2,9 +2,9 @@ use std::{io, net, error, time};
 use std::sync::Arc;
 use std::net::SocketAddr;
 use parking_lot::RwLock;
-use futures::{Future, finished, failed, BoxFuture};
+use futures::{Future, finished, failed};
 use futures::stream::Stream;
-use futures_cpupool::CpuPool;
+use futures_cpupool::{CpuPool, Builder as CpuPoolBuilder};
 use tokio_io::IoFuture;
 use tokio_core::net::{TcpListener, TcpStream};
 use tokio_core::reactor::{Handle, Remote, Timeout, Interval};
@@ -12,6 +12,7 @@ use abstract_ns::Resolver;
 use ns_dns_tokio::DnsResolver;
 use message::{Payload, MessageResult, Message};
 use message::common::Services;
+use message::types::addr::AddressEntry;
 use net::{connect, Connections, Channel, Config as NetConfig, accept_connection, ConnectionCounter};
 use util::{NodeTable, Node, NodeTableError, Direction};
 use session::{SessionFactory, SeednodeSessionFactory, NormalSessionFactory};
@@ -19,7 +20,7 @@ use {Config, PeerId};
 use protocol::{LocalSyncNodeRef, InboundSyncConnectionRef, OutboundSyncConnectionRef};
 use io::DeadlineStatus;
 
-pub type BoxedEmptyFuture = BoxFuture<(), ()>;
+pub type BoxedEmptyFuture = Box<dyn Future<Item=(), Error=()> + Send>;
 
 /// Network context.
 pub struct Context {
@@ -41,11 +42,11 @@ pub struct Context {
 
 impl Context {
 	/// Creates new context with reference to local sync node, thread pool and event loop.
-	pub fn new(local_sync_node: LocalSyncNodeRef, pool_handle: CpuPool, remote: Remote, config: Config) -> Result<Self, Box<error::Error>> {
+	pub fn new(local_sync_node: LocalSyncNodeRef, pool_handle: CpuPool, remote: Remote, config: Config) -> Result<Self, Box<dyn error::Error>> {
 		let context = Context {
 			connections: Default::default(),
 			connection_counter: ConnectionCounter::new(config.inbound_connections, config.outbound_connections),
-			node_table: RwLock::new(try!(NodeTable::from_file(&config.node_table_path))),
+			node_table: RwLock::new(try!(NodeTable::from_file(config.preferable_services, &config.node_table_path))),
 			pool: pool_handle,
 			remote: remote,
 			local_sync_node: local_sync_node,
@@ -84,9 +85,15 @@ impl Context {
 	}
 
 	/// Updates node table.
-	pub fn update_node_table(&self, nodes: Vec<Node>) {
+	pub fn update_node_table(&self, nodes: Vec<AddressEntry>) {
 		trace!("Updating node table with {} entries", nodes.len());
 		self.node_table.write().insert_many(nodes);
+	}
+
+	/// Penalize node.
+	pub fn penalize_node(&self, addr: &SocketAddr) {
+		trace!("Penalizing node {}", addr);
+		self.node_table.write().note_failure(addr);
 	}
 
 	/// Adds node to table.
@@ -106,7 +113,7 @@ impl Context {
 	pub fn autoconnect(context: Arc<Context>, handle: &Handle) {
 		let c = context.clone();
 		// every 10 seconds connect to new peers (if needed)
-		let interval: BoxedEmptyFuture = Interval::new_at(time::Instant::now(), time::Duration::new(10, 0), handle).expect("Failed to create interval")
+		let interval: BoxedEmptyFuture = Box::new(Interval::new_at(time::Instant::now(), time::Duration::new(10, 0), handle).expect("Failed to create interval")
 			.and_then(move |_| {
 				// print traces
 				let ic = context.connection_counter.inbound_connections();
@@ -120,6 +127,7 @@ impl Context {
 
 				let needed = context.connection_counter.outbound_connections_needed() as usize;
 				if needed != 0 {
+					// TODO: pass Services::with_bitcoin_cash(true) after HF block
 					let used_addresses = context.connections.addresses();
 					let peers = context.node_table.read().nodes_with_services(&Services::default(), context.config.internet_protocol, &used_addresses, needed);
 					let addresses = peers.into_iter()
@@ -139,8 +147,7 @@ impl Context {
 				Ok(())
 			})
 			.for_each(|_| Ok(()))
-			.then(|_| finished(()))
-			.boxed();
+			.then(|_| finished(())));
 		c.spawn(interval);
 	}
 
@@ -148,7 +155,7 @@ impl Context {
 	fn connect_future<T>(context: Arc<Context>, socket: net::SocketAddr, handle: &Handle, config: &NetConfig) -> BoxedEmptyFuture where T: SessionFactory {
 		trace!("Trying to connect to: {}", socket);
 		let connection = connect(&socket, handle, config);
-		connection.then(move |result| {
+		Box::new(connection.then(move |result| {
 			match result {
 				Ok(DeadlineStatus::Meet(Ok(connection))) => {
 					// successfull hanshake
@@ -166,7 +173,7 @@ impl Context {
 					// TODO: close socket
 					context.node_table.write().note_failure(&socket);
 					context.connection_counter.note_close_outbound_connection();
-					finished(Ok(())).boxed()
+					Box::new(finished(Ok(())))
 				},
 				Ok(DeadlineStatus::Timeout) => {
 					// connection time out
@@ -174,19 +181,18 @@ impl Context {
 					// TODO: close socket
 					context.node_table.write().note_failure(&socket);
 					context.connection_counter.note_close_outbound_connection();
-					finished(Ok(())).boxed()
+					Box::new(finished(Ok(())))
 				},
 				Err(_) => {
 					// network error
 					trace!("Unable to connect to {}", socket);
 					context.node_table.write().note_failure(&socket);
 					context.connection_counter.note_close_outbound_connection();
-					finished(Ok(())).boxed()
+					Box::new(finished(Ok(())))
 				}
 			}
 		})
-		.then(|_| finished(()))
-		.boxed()
+		.then(|_| finished(())))
 	}
 
 	/// Connect to socket using given context.
@@ -203,7 +209,7 @@ impl Context {
 	}
 
 	pub fn accept_connection_future(context: Arc<Context>, stream: TcpStream, socket: net::SocketAddr, handle: &Handle, config: NetConfig) -> BoxedEmptyFuture {
-		accept_connection(stream, handle, &config, socket).then(move |result| {
+		Box::new(accept_connection(stream, handle, &config, socket).then(move |result| {
 			match result {
 				Ok(DeadlineStatus::Meet(Ok(connection))) => {
 					// successfull hanshake
@@ -221,7 +227,7 @@ impl Context {
 					// TODO: close socket
 					context.node_table.write().note_failure(&socket);
 					context.connection_counter.note_close_inbound_connection();
-					finished(Ok(())).boxed()
+					Box::new(finished(Ok(())))
 				},
 				Ok(DeadlineStatus::Timeout) => {
 					// connection time out
@@ -229,19 +235,18 @@ impl Context {
 					// TODO: close socket
 					context.node_table.write().note_failure(&socket);
 					context.connection_counter.note_close_inbound_connection();
-					finished(Ok(())).boxed()
+					Box::new(finished(Ok(())))
 				},
 				Err(_) => {
 					// network error
 					trace!("Accepting handshake from {} failed with network error", socket);
 					context.node_table.write().note_failure(&socket);
 					context.connection_counter.note_close_inbound_connection();
-					finished(Ok(())).boxed()
+					Box::new(finished(Ok(())))
 				}
 			}
 		})
-		.then(|_| finished(()))
-		.boxed()
+		.then(|_| finished(())))
 	}
 
 	pub fn accept_connection(context: Arc<Context>, stream: TcpStream, socket: net::SocketAddr, config: NetConfig) {
@@ -255,7 +260,7 @@ impl Context {
 	pub fn listen(context: Arc<Context>, handle: &Handle, config: NetConfig) -> Result<BoxedEmptyFuture, io::Error> {
 		trace!("Starting tcp server");
 		let server = try!(TcpListener::bind(&config.local_address, handle));
-		let server = server.incoming()
+		let server = Box::new(server.incoming()
 			.and_then(move |(stream, socket)| {
 				// because we acquire atomic value twice,
 				// it may happen that accept slightly more connections than we need
@@ -269,14 +274,13 @@ impl Context {
 				Ok(())
 			})
 			.for_each(|_| Ok(()))
-			.then(|_| finished(()))
-			.boxed();
+			.then(|_| finished(())));
 		Ok(server)
 	}
 
 	/// Called on incomming mesage.
 	pub fn on_message(context: Arc<Context>, channel: Arc<Channel>) -> IoFuture<MessageResult<()>> {
-		channel.read_message().then(move |result| {
+		Box::new(channel.read_message().then(move |result| {
 			match result {
 				Ok(Ok((command, payload))) => {
 					// successful read
@@ -287,43 +291,43 @@ impl Context {
 							context.node_table.write().note_used(&channel.peer_info().address);
 							let on_message = Context::on_message(context.clone(), channel);
 							context.spawn(on_message);
-							finished(Ok(())).boxed()
+							Box::new(finished(Ok(())))
 						},
 						Err(err) => {
 							// protocol error
 							context.close_channel_with_error(channel.peer_info().id, &err);
-							finished(Err(err)).boxed()
+							Box::new(finished(Err(err)))
 						}
 					}
 				},
 				Ok(Err(err)) => {
 					// protocol error
 					context.close_channel_with_error(channel.peer_info().id, &err);
-					finished(Err(err)).boxed()
+					Box::new(finished(Err(err)))
 				},
 				Err(err) => {
 					// network error
 					// TODO: remote node was just turned off. should we mark it as not reliable?
 					context.close_channel_with_error(channel.peer_info().id, &err);
-					failed(err).boxed()
+					Box::new(failed(err))
 				}
 			}
-		}).boxed()
+		}))
 	}
 
 	/// Send message to a channel with given peer id.
-	pub fn send_to_peer<T>(context: Arc<Context>, peer: PeerId, payload: &T) -> IoFuture<()> where T: Payload {
+	pub fn send_to_peer<T>(context: Arc<Context>, peer: PeerId, payload: &T, serialization_flags: u32) -> IoFuture<()> where T: Payload {
 		match context.connections.channel(peer) {
 			Some(channel) => {
 				let info = channel.peer_info();
-				let message = Message::new(info.magic, info.version, payload).expect("failed to create outgoing message");
+				let message = Message::with_flags(info.magic, info.version, payload, serialization_flags).expect("failed to create outgoing message");
 				channel.session().stats().lock().report_send(T::command().into(), message.len());
 				Context::send(context, channel, message)
 			},
 			None => {
 				// peer no longer exists.
 				// TODO: should we return error here?
-				finished(()).boxed()
+				Box::new(finished(()))
 			}
 		}
 	}
@@ -334,7 +338,7 @@ impl Context {
 			None => {
 				// peer no longer exists.
 				// TODO: should we return error here?
-				finished(()).boxed()
+				Box::new(finished(()))
 			}
 		}
 	}
@@ -342,20 +346,20 @@ impl Context {
 	/// Send message using given channel.
 	pub fn send<T>(_context: Arc<Context>, channel: Arc<Channel>, message: T) -> IoFuture<()> where T: AsRef<[u8]> + Send + 'static {
 		//trace!("Sending {} message to {}", T::command(), channel.peer_info().address);
-		channel.write_message(message).then(move |result| {
+		Box::new(channel.write_message(message).then(move |result| {
 			match result {
 				Ok(_) => {
 					// successful send
 					//trace!("Sent {} message to {}", T::command(), channel.peer_info().address);
-					finished(()).boxed()
+					Box::new(finished(()))
 				},
 				Err(err) => {
 					// network error
 					// closing connection is handled in on_message`
-					failed(err).boxed()
+					Box::new(failed(err))
 				},
 			}
-		}).boxed()
+		}))
 	}
 
 	/// Close channel with given peer info.
@@ -373,7 +377,7 @@ impl Context {
 	}
 
 	/// Close channel with given peer info.
-	pub fn close_channel_with_error(&self, id: PeerId, error: &error::Error) {
+	pub fn close_channel_with_error(&self, id: PeerId, error: &dyn error::Error) {
 		if let Some(channel) = self.connections.remove(id) {
 			let info = channel.peer_info();
 			channel.session().on_close();
@@ -387,8 +391,8 @@ impl Context {
 		}
 	}
 
-	pub fn create_sync_session(&self, start_height: i32, outbound_connection: OutboundSyncConnectionRef) -> InboundSyncConnectionRef {
-		self.local_sync_node.create_sync_session(start_height, outbound_connection)
+	pub fn create_sync_session(&self, start_height: i32, services: Services, outbound_connection: OutboundSyncConnectionRef) -> InboundSyncConnectionRef {
+		self.local_sync_node.create_sync_session(start_height, services, outbound_connection)
 	}
 
 	pub fn connections(&self) -> &Connections {
@@ -425,8 +429,11 @@ impl Drop for P2P {
 }
 
 impl P2P {
-	pub fn new(config: Config, local_sync_node: LocalSyncNodeRef, handle: Handle) -> Result<Self, Box<error::Error>> {
-		let pool = CpuPool::new(config.threads);
+	pub fn new(config: Config, local_sync_node: LocalSyncNodeRef, handle: Handle) -> Result<Self, Box<dyn error::Error>> {
+		let pool = CpuPoolBuilder::new()
+			.name_prefix("I/O thread")
+			.pool_size(config.threads)
+			.create();
 
 		let context = try!(Context::new(local_sync_node, pool.clone(), handle.remote().clone(), config.clone()));
 
@@ -440,7 +447,7 @@ impl P2P {
 		Ok(p2p)
 	}
 
-	pub fn run(&self) -> Result<(), Box<error::Error>> {
+	pub fn run(&self) -> Result<(), Box<dyn error::Error>> {
 		for peer in &self.config.peers {
 			self.connect::<NormalSessionFactory>(*peer);
 		}
@@ -460,7 +467,7 @@ impl P2P {
 		Context::connect::<T>(self.context.clone(), addr);
 	}
 
-	pub fn connect_to_seednode(&self, resolver: &Resolver, seednode: &str) {
+	pub fn connect_to_seednode(&self, resolver: &dyn Resolver, seednode: &str) {
 		let owned_seednode = seednode.to_owned();
 		let context = self.context.clone();
 		let dns_lookup = resolver.resolve(seednode).then(move |result| {
@@ -484,7 +491,7 @@ impl P2P {
 		self.event_loop_handle.spawn(pool_work);
 	}
 
-	fn listen(&self) -> Result<(), Box<error::Error>> {
+	fn listen(&self) -> Result<(), Box<dyn error::Error>> {
 		let server = try!(Context::listen(self.context.clone(), &self.event_loop_handle, self.config.connection.clone()));
 		self.event_loop_handle.spawn(server);
 		Ok(())

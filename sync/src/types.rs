@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use futures::BoxFuture;
+use futures::Future;
 use parking_lot::{Mutex, RwLock};
-use db;
+use storage;
 use local_node::LocalNode;
 use miner::MemoryPool;
 use super::SyncListener;
@@ -21,10 +21,10 @@ pub type RequestId = u32;
 pub type PeerIndex = usize;
 
 // No-error, no-result future
-pub type EmptyBoxFuture = BoxFuture<(), ()>;
+pub type EmptyBoxFuture = Box<dyn Future<Item=(), Error=()> + Send>;
 
 /// Reference to storage
-pub type StorageRef = db::SharedStore;
+pub type StorageRef = storage::SharedStore;
 
 /// Reference to memory pool
 pub type MemoryPoolRef = Arc<RwLock<MemoryPool>>;
@@ -33,7 +33,7 @@ pub type MemoryPoolRef = Arc<RwLock<MemoryPool>>;
 pub type SynchronizationStateRef = Arc<SynchronizationState>;
 
 /// Reference to peers
-pub type PeersRef = Arc<Peers>;
+pub type PeersRef = Arc<dyn Peers>;
 
 /// Reference to synchronization tasks executor
 pub type ExecutorRef<T> = Arc<T>;
@@ -48,7 +48,7 @@ pub type ClientCoreRef<T> = Arc<Mutex<T>>;
 pub type ServerRef<T> = Arc<T>;
 
 /// Reference to local node
-pub type LocalNodeRef = Arc<LocalNode<LocalSynchronizationTaskExecutor, ServerImpl, SynchronizationClient<LocalSynchronizationTaskExecutor, AsyncVerifier>>>;
+pub type LocalNodeRef = Arc<LocalNode<ServerImpl, SynchronizationClient<LocalSynchronizationTaskExecutor, AsyncVerifier>>>;
 
 /// Synchronization events listener reference
-pub type SyncListenerRef = Box<SyncListener>;
+pub type SyncListenerRef = Box<dyn SyncListener>;

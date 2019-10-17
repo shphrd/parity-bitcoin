@@ -6,9 +6,9 @@ authors = ["Parity Technologies <admin@parity.io>"]
 description = "Parity bitcoin client."
 
 [dependencies]
-log = "0.3"
-env_logger = "0.4"
-app_dirs = "^1.1.1"
+log = "0.4"
+env_logger = "0.5"
+app_dirs = { git = "https://github.com/paritytech/app-dirs-rs" }
 libc = "0.2"
 clap = { version = "2", features = ["yaml"] }
 chain = { path = "chain" }
@@ -18,6 +18,7 @@ network = { path = "network" }
 miner = { path = "miner" }
 p2p = { path = "p2p" }
 script = { path = "script" }
+storage = { path = "storage" }
 db = { path = "db" }
 verification = { path = "verification" }
 sync = { path = "sync" }
@@ -35,9 +36,6 @@ debug = true
 panic = 'abort'
 
 [profile.test]
-debug = true
-
-[profile.doc]
 debug = true
 
 [[bin]]

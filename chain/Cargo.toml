@@ -4,9 +4,14 @@ version = "0.1.0"
 authors = ["debris <marek.kotewicz@gmail.com>"]
 
 [dependencies]
-rustc-serialize = "0.3"
-heapsize = "0.3"
+rustc-hex = "2"
+heapsize = "0.4"
+rayon = "1.0"
 bitcrypto = { path = "../crypto" }
 primitives = { path = "../primitives" }
 serialization = { path = "../serialization" }
+serialization_derive = { path = "../serialization_derive" }
 
+[features]
+default = []
+test-helpers = []

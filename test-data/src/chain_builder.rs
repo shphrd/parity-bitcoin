@@ -64,6 +64,11 @@ impl TransactionBuilder {
 		builder.add_input(&Transaction::default(), output_index)
 	}
 
+	pub fn with_input(transaction: &Transaction, output_index: u32) -> TransactionBuilder {
+		let builder = TransactionBuilder::default();
+		builder.add_input(transaction, output_index)
+	}
+
 	pub fn reset(self) -> TransactionBuilder {
 		TransactionBuilder::default()
 	}
@@ -107,6 +112,7 @@ impl TransactionBuilder {
 			},
 			script_sig: Bytes::new_with_len(0),
 			sequence: 0xffffffff,
+			script_witness: vec![],
 		});
 		self
 	}
@@ -123,6 +129,7 @@ impl TransactionBuilder {
 			},
 			script_sig: Bytes::new_with_len(0),
 			sequence: 0xffffffff,
+			script_witness: vec![],
 		}];
 		self
 	}

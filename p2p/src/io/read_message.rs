@@ -25,7 +25,6 @@ enum ReadMessageState<M, A> {
 	ReadPayload {
 		future: ReadPayload<M, A>,
 	},
-	Finished,
 }
 
 pub struct ReadMessage<M, A> {
@@ -38,36 +37,30 @@ impl<M, A> Future for ReadMessage<M, A> where A: AsyncRead, M: Payload {
 	type Error = io::Error;
 
 	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-		let (next, result) = match self.state {
-			ReadMessageState::ReadHeader { version, ref mut future } => {
-				let (read, header) = try_ready!(future.poll());
-				let header = match header {
-					Ok(header) => header,
-					Err(err) => return Ok((read, Err(err)).into()),
-				};
-				if header.command != M::command() {
-					return Ok((read, Err(Error::InvalidCommand)).into());
-				}
-				let future = read_payload(
-					read, version, header.len as usize, header.checksum,
-				);
-				let next = ReadMessageState::ReadPayload {
-					future: future,
-				};
-				(next, Async::NotReady)
-			},
-			ReadMessageState::ReadPayload { ref mut future } => {
-				let (read, payload) = try_ready!(future.poll());
-				(ReadMessageState::Finished, Async::Ready((read, payload)))
-			},
-			ReadMessageState::Finished => panic!("poll ReadMessage after it's done"),
-		};
-
-		self.state = next;
-		match result {
-			// by polling again, we register new future
-			Async::NotReady => self.poll(),
-			result => Ok(result)
+		loop {
+			let next_state = match self.state {
+				ReadMessageState::ReadHeader { version, ref mut future } => {
+					let (read, header) = try_ready!(future.poll());
+					let header = match header {
+						Ok(header) => header,
+						Err(err) => return Ok((read, Err(err)).into()),
+					};
+					if header.command != M::command() {
+						return Ok((read, Err(Error::InvalidCommand)).into());
+					}
+					let future = read_payload(
+						read, version, header.len as usize, header.checksum,
+					);
+					ReadMessageState::ReadPayload {
+						future: future,
+					}
+				},
+				ReadMessageState::ReadPayload { ref mut future } => {
+					let (read, payload) = try_ready!(future.poll());
+					return Ok(Async::Ready((read, payload)));
+				},
+			};
+			self.state = next_state;
 		}
 	}
 }
@@ -76,7 +69,7 @@ impl<M, A> Future for ReadMessage<M, A> where A: AsyncRead, M: Payload {
 mod tests {
 	use futures::Future;
 	use bytes::Bytes;
-	use network::Magic;
+	use network::{Network, ConsensusFork};
 	use message::Error;
 	use message::types::{Ping, Pong};
 	use super::read_message;
@@ -85,21 +78,21 @@ mod tests {
 	fn test_read_message() {
 		let raw: Bytes = "f9beb4d970696e6700000000000000000800000083c00c765845303b6da97786".into();
 		let ping = Ping::new(u64::from_str_radix("8677a96d3b304558", 16).unwrap());
-		assert_eq!(read_message(raw.as_ref(), Magic::Mainnet, 0).wait().unwrap().1, Ok(ping));
-		assert_eq!(read_message::<Ping, _>(raw.as_ref(), Magic::Testnet, 0).wait().unwrap().1, Err(Error::InvalidMagic));
-		assert_eq!(read_message::<Pong, _>(raw.as_ref(), Magic::Mainnet, 0).wait().unwrap().1, Err(Error::InvalidCommand));
+		assert_eq!(read_message(raw.as_ref(), Network::Mainnet.magic(&ConsensusFork::BitcoinCore), 0).wait().unwrap().1, Ok(ping));
+		assert_eq!(read_message::<Ping, _>(raw.as_ref(), Network::Testnet.magic(&ConsensusFork::BitcoinCore), 0).wait().unwrap().1, Err(Error::InvalidMagic));
+		assert_eq!(read_message::<Pong, _>(raw.as_ref(), Network::Mainnet.magic(&ConsensusFork::BitcoinCore), 0).wait().unwrap().1, Err(Error::InvalidCommand));
 	}
 
 	#[test]
 	fn test_read_too_short_message() {
 		let raw: Bytes = "f9beb4d970696e6700000000000000000800000083c00c765845303b6da977".into();
-		assert!(read_message::<Ping, _>(raw.as_ref(), Magic::Mainnet, 0).wait().is_err());
+		assert!(read_message::<Ping, _>(raw.as_ref(), Network::Mainnet.magic(&ConsensusFork::BitcoinCore), 0).wait().is_err());
 	}
 
 
 	#[test]
 	fn test_read_message_with_invalid_checksum() {
 		let raw: Bytes = "f9beb4d970696e6700000000000000000800000083c01c765845303b6da97786".into();
-		assert_eq!(read_message::<Ping, _>(raw.as_ref(), Magic::Mainnet, 0).wait().unwrap().1, Err(Error::InvalidChecksum));
+		assert_eq!(read_message::<Ping, _>(raw.as_ref(), Network::Mainnet.magic(&ConsensusFork::BitcoinCore), 0).wait().unwrap().1, Err(Error::InvalidChecksum));
 	}
 }

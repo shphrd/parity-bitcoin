@@ -8,7 +8,12 @@ use message::common::Command;
 
 pub use self::addr::{AddrProtocol, SeednodeProtocol};
 pub use self::ping::PingProtocol;
-pub use self::sync::{SyncProtocol, InboundSyncConnection, InboundSyncConnectionRef, OutboundSyncConnection, OutboundSyncConnectionRef, LocalSyncNode, LocalSyncNodeRef};
+pub use self::sync::{SyncProtocol,
+	InboundSyncConnection, InboundSyncConnectionRef,
+	InboundSyncConnectionState, InboundSyncConnectionStateRef,
+	OutboundSyncConnection, OutboundSyncConnectionRef,
+	LocalSyncNode, LocalSyncNodeRef,
+};
 
 pub trait Protocol: Send {
 	/// Initialize the protocol.
@@ -24,7 +29,7 @@ pub trait Protocol: Send {
 	fn on_close(&mut self) {}
 
 	/// Boxes the protocol.
-	fn boxed(self) -> Box<Protocol> where Self: Sized + 'static {
+	fn boxed(self) -> Box<dyn Protocol> where Self: Sized + 'static {
 		Box::new(self)
 	}
 }

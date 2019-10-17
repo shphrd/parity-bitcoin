@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use serde;
 use serde::de::Unexpected;
-use rustc_serialize::hex::{ToHex, FromHex};
+use hex::{ToHex, FromHex};
 use primitives::hash::H256 as GlobalH256;
 use primitives::hash::H160 as GlobalH160;
 
@@ -22,7 +22,7 @@ macro_rules! impl_hash {
 
 		impl fmt::Debug for $name {
 			fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-				write!(f, "{}", $other::from(self.0.clone()).to_hex())
+				write!(f, "{}", $other::from(self.0.clone()).to_hex::<String>())
 			}
 		}
 
@@ -89,16 +89,16 @@ macro_rules! impl_hash {
 			fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 			where S: serde::Serializer {
 				let mut hex = String::new();
-				hex.push_str(&$other::from(self.0.clone()).to_hex());
+				hex.push_str(&$other::from(self.0.clone()).to_hex::<String>());
 				serializer.serialize_str(&hex)
 			}
 		}
 
-		impl serde::Deserialize for $name {
-			fn deserialize<D>(deserializer: D) -> Result<$name, D::Error> where D: serde::Deserializer {
+		impl<'a> serde::Deserialize<'a> for $name {
+			fn deserialize<D>(deserializer: D) -> Result<$name, D::Error> where D: serde::Deserializer<'a> {
 				struct HashVisitor;
 
-				impl serde::de::Visitor for HashVisitor {
+				impl<'b> serde::de::Visitor<'b> for HashVisitor {
 					type Value = $name;
 
 					fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -111,7 +111,7 @@ macro_rules! impl_hash {
 							return Err(E::invalid_value(Unexpected::Str(value), &self))
 						}
 
-						match value[..].from_hex() {
+						match value[..].from_hex::<Vec<u8>>() {
 							Ok(ref v) => {
 								let mut result = [0u8; $size];
 								result.copy_from_slice(v);
@@ -127,7 +127,7 @@ macro_rules! impl_hash {
 					}
 				}
 
-				deserializer.deserialize(HashVisitor)
+				deserializer.deserialize_identifier(HashVisitor)
 			}
 		}
 	}

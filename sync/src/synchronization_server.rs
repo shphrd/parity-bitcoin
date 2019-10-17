@@ -273,21 +273,31 @@ impl<TExecutor> ServerTaskExecutor<TExecutor> where TExecutor: TaskExecutor {
 					notfound.inventory.push(next_item);
 				}
 			},
+			common::InventoryType::MessageWitnessTx => {
+				// only transaction from memory pool can be requested
+				if let Some(transaction) = self.memory_pool.read().read_by_hash(&next_item.hash) {
+					trace!(target: "sync", "'getblocks' response to peer#{} is ready with witness-tx {}", peer_index, next_item.hash.to_reversed_str());
+					let transaction = IndexedTransaction::new(next_item.hash, transaction.clone());
+					self.executor.execute(Task::WitnessTransaction(peer_index, transaction));
+				} else {
+					notfound.inventory.push(next_item);
+				}
+			},
 			common::InventoryType::MessageBlock => {
 				if let Some(block) = self.storage.block(next_item.hash.clone().into()) {
 					trace!(target: "sync", "'getblocks' response to peer#{} is ready with block {}", peer_index, next_item.hash.to_reversed_str());
-					self.executor.execute(Task::Block(peer_index, block.into()));
+					self.executor.execute(Task::Block(peer_index, block));
 				} else {
 					notfound.inventory.push(next_item);
 				}
 			},
 			common::InventoryType::MessageFilteredBlock => {
 				if let Some(block) = self.storage.block(next_item.hash.clone().into()) {
-					let message_artefacts = self.peers.build_merkle_block(peer_index, &block.into());
+					let message_artefacts = self.peers.build_merkle_block(peer_index, &block);
 					if let Some(message_artefacts) = message_artefacts {
 						// send merkleblock first
 						trace!(target: "sync", "'getblocks' response to peer#{} is ready with merkleblock {}", peer_index, next_item.hash.to_reversed_str());
-						self.executor.execute(Task::MerkleBlock(peer_index, message_artefacts.merkleblock));
+						self.executor.execute(Task::MerkleBlock(peer_index, *block.hash(), message_artefacts.merkleblock));
 
 						// also send all matched transactions
 						for matched_transaction in message_artefacts.matching_transactions {
@@ -303,18 +313,24 @@ impl<TExecutor> ServerTaskExecutor<TExecutor> where TExecutor: TaskExecutor {
 			},
 			common::InventoryType::MessageCompactBlock => {
 				if let Some(block) = self.storage.block(next_item.hash.clone().into()) {
-					let message = self.peers.build_compact_block(peer_index, &block.into());
+					let message = self.peers.build_compact_block(peer_index, &block);
 					if let Some(message) = message {
 						trace!(target: "sync", "'getblocks' response to peer#{} is ready with compactblock {}", peer_index, next_item.hash.to_reversed_str());
-						self.executor.execute(Task::CompactBlock(peer_index, message));
+						self.executor.execute(Task::CompactBlock(peer_index, *block.hash(), message));
 					}
 				} else {
 					notfound.inventory.push(next_item);
 				}
 			},
-			_ => {
-
+			common::InventoryType::MessageWitnessBlock => {
+				if let Some(block) = self.storage.block(next_item.hash.clone().into()) {
+					trace!(target: "sync", "'getblocks' response to peer#{} is ready with witness-block {}", peer_index, next_item.hash.to_reversed_str());
+					self.executor.execute(Task::WitnessBlock(peer_index, block.into()));
+				} else {
+					notfound.inventory.push(next_item);
+				}
 			},
+			common::InventoryType::Error | common::InventoryType::MessageWitnessFilteredBlock => (),
 		}
 
 		Some(ServerTask::ReversedGetData(peer_index, message, notfound))
@@ -352,6 +368,7 @@ impl<TExecutor> ServerTaskExecutor<TExecutor> where TExecutor: TaskExecutor {
 				.map(|block_hash| self.storage.block_header(block_hash.into()))
 				.take_while(Option::is_some)
 				.map(Option::unwrap)
+				.map(|h| h.raw)
 				.collect();
 			// empty inventory messages are invalid according to regtests, while empty headers messages are valid
 			trace!(target: "sync", "'getheaders' response to peer#{} is ready with {} headers", peer_index, headers.len());
@@ -424,7 +441,7 @@ impl<TExecutor> ServerTaskExecutor<TExecutor> where TExecutor: TaskExecutor {
 		self.executor.execute(Task::BlockTxn(peer_index, types::BlockTxn {
 			request: common::BlockTransactions {
 				blockhash: message.request.blockhash,
-				transactions: transactions,
+				transactions: transactions.into_iter().map(|tx| tx.raw).collect(),
 			}
 		}));
 	}
@@ -445,11 +462,11 @@ impl<TExecutor> ServerTaskExecutor<TExecutor> where TExecutor: TaskExecutor {
 					Some(block_header) => block_header,
 				};
 
-				if let Some(block_number) = self.storage.block_number(&block_header.previous_header_hash) {
+				if let Some(block_number) = self.storage.block_number(&block_header.raw.previous_header_hash) {
 					return Some(block_number);
 				}
 
-				block_hash = block_header.previous_header_hash;
+				block_hash = block_header.raw.previous_header_hash;
 			}
 		}
 
@@ -466,11 +483,11 @@ pub mod tests {
 	use parking_lot::{Mutex, RwLock};
 	use db::{BlockChainDatabase};
 	use message::types;
-	use message::common::{self, InventoryVector, InventoryType};
+	use message::common::{self, Services, InventoryVector, InventoryType};
 	use primitives::hash::H256;
 	use chain::Transaction;
 	use inbound_connection::tests::DummyOutboundSyncConnection;
-	use miner::MemoryPool;
+	use miner::{NonZeroFeeCalculator, MemoryPool};
 	use local_node::tests::{default_filterload, make_filteradd};
 	use synchronization_executor::Task;
 	use synchronization_executor::tests::DummyTaskExecutor;
@@ -563,7 +580,7 @@ pub mod tests {
 	#[test]
 	fn server_getblocks_responds_inventory_when_have_unknown_blocks() {
 		let (storage, _, executor, _, server) = create_synchronization_server();
-		storage.insert(&test_data::block_h1().into()).expect("Db write error");
+		storage.insert(test_data::block_h1().into()).expect("Db write error");
 		storage.canonize(&test_data::block_h1().hash()).unwrap();
 		// when asking for blocks hashes
 		server.execute(ServerTask::GetBlocks(0, types::GetBlocks {
@@ -599,7 +616,7 @@ pub mod tests {
 	#[test]
 	fn server_getheaders_responds_headers_when_have_unknown_blocks() {
 		let (storage, _, executor, _, server) = create_synchronization_server();
-		storage.insert(&test_data::block_h1().into()).expect("Db write error");
+		storage.insert(test_data::block_h1().into()).expect("Db write error");
 		storage.canonize(&test_data::block_h1().hash()).unwrap();
 		// when asking for blocks hashes
 		let dummy_id = 0;
@@ -632,7 +649,7 @@ pub mod tests {
 		// when memory pool is non-empty
 		let transaction = Transaction::default();
 		let transaction_hash = transaction.hash();
-		memory_pool.write().insert_verified(transaction.into());
+		memory_pool.write().insert_verified(transaction.into(), &NonZeroFeeCalculator);
 		// when asking for memory pool transactions ids
 		server.execute(ServerTask::Mempool(0));
 		// => respond with inventory
@@ -648,7 +665,7 @@ pub mod tests {
 	fn server_get_block_txn_responds_when_good_request() {
 		let (_, _, executor, peers, server) = create_synchronization_server();
 
-		peers.insert(0, DummyOutboundSyncConnection::new());
+		peers.insert(0, Services::default(), DummyOutboundSyncConnection::new());
 		peers.hash_known_as(0, test_data::genesis().hash(), KnownHashType::CompactBlock);
 
 		// when asking for block_txns
@@ -673,7 +690,7 @@ pub mod tests {
 	fn server_get_block_txn_do_not_responds_when_bad_request() {
 		let (_, _, _, peers, server) = create_synchronization_server();
 
-		peers.insert(0, DummyOutboundSyncConnection::new());
+		peers.insert(0, Services::default(), DummyOutboundSyncConnection::new());
 		assert!(peers.enumerate().contains(&0));
 
 		// when asking for block_txns
@@ -718,7 +735,7 @@ pub mod tests {
 		let tx_verified_hash = tx_verified.hash();
 		// given in-memory transaction
 		{
-			memory_pool.write().insert_verified(tx_verified.clone().into());
+			memory_pool.write().insert_verified(tx_verified.clone().into(), &NonZeroFeeCalculator);
 		}
 		// when asking for known in-memory transaction
 		let inventory = vec![
@@ -743,7 +760,7 @@ pub mod tests {
 	fn server_responds_with_nonempty_inventory_when_getdata_stop_hash_filled() {
 		let (storage, _, executor, _, server) = create_synchronization_server();
 		{
-			storage.insert(&test_data::block_h1().into()).expect("no error");
+			storage.insert(test_data::block_h1().into()).expect("no error");
 			storage.canonize(&test_data::block_h1().hash()).unwrap();
 		}
 		// when asking with stop_hash
@@ -765,7 +782,7 @@ pub mod tests {
 	fn server_responds_with_nonempty_headers_when_getdata_stop_hash_filled() {
 		let (storage, _, executor, _, server) = create_synchronization_server();
 		{
-			storage.insert(&test_data::block_h1().into()).expect("no error");
+			storage.insert(test_data::block_h1().into()).expect("no error");
 			storage.canonize(&test_data::block_h1().hash()).unwrap();
 		}
 		// when asking with stop_hash
@@ -806,13 +823,13 @@ pub mod tests {
 		let b2_hash = b2.hash();
 
 		// This peer will provide blocks
-		storage.insert(&b1.clone().into()).expect("no error");
-		storage.insert(&b2.clone().into()).expect("no error");
+		storage.insert(b1.clone().into()).expect("no error");
+		storage.insert(b2.clone().into()).expect("no error");
 		storage.canonize(&b1.hash()).unwrap();
 		storage.canonize(&b2.hash()).unwrap();
 
 		// This peer won't get any blocks, because it has not set filter for the connection
-		let peer_index2 = 1; peers.insert(peer_index2, DummyOutboundSyncConnection::new());
+		let peer_index2 = 1; peers.insert(peer_index2, Services::default(), DummyOutboundSyncConnection::new());
 
 		let mut loop_task = ServerTask::GetData(peer_index2, types::GetData {inventory: vec![
 			InventoryVector { inv_type: InventoryType::MessageFilteredBlock, hash: b1_hash.clone() },
@@ -835,7 +852,7 @@ pub mod tests {
 
 		let mut counter = 2;
 		for (get_tx1, get_tx2) in peers_config {
-			let peer_index = counter; peers.insert(peer_index, DummyOutboundSyncConnection::new());
+			let peer_index = counter; peers.insert(peer_index, Services::default(), DummyOutboundSyncConnection::new());
 			counter += 1;
 			// setup filter
 			peers.set_bloom_filter(peer_index, default_filterload());
@@ -859,7 +876,7 @@ pub mod tests {
 			let mut index = 0;
 			let tasks = sync_executor.take_tasks();
 			match tasks[index] {
-				Task::MerkleBlock(_, _) => {
+				Task::MerkleBlock(_, _, _) => {
 					if get_tx1 {
 						index += 1;
 						match tasks[index] {
@@ -873,7 +890,7 @@ pub mod tests {
 			index += 1;
 
 			match tasks[index] {
-				Task::MerkleBlock(_, _) => {
+				Task::MerkleBlock(_, _, _) => {
 					if get_tx2 {
 						index += 1;
 						match tasks[index] {
@@ -902,11 +919,11 @@ pub mod tests {
 		let b1_hash = b1.hash();
 
 		// This peer will provide blocks
-		storage.insert(&b1.clone().into()).expect("no error");
+		storage.insert(b1.clone().into()).expect("no error");
 		storage.canonize(&b1.hash()).unwrap();
 
 		// This peer will receive compact block
-		let peer_index2 = 1; peers.insert(peer_index2, DummyOutboundSyncConnection::new());
+		let peer_index2 = 1; peers.insert(peer_index2, Services::default(), DummyOutboundSyncConnection::new());
 
 		// ask for data
 		let mut loop_task = ServerTask::GetData(peer_index2, types::GetData {inventory: vec![
@@ -919,7 +936,7 @@ pub mod tests {
 		let tasks = sync_executor.take_tasks();
 		assert_eq!(tasks.len(), 1);
 		match tasks[0] {
-			Task::CompactBlock(_, _) => (),
+			Task::CompactBlock(_, _, _) => (),
 			_ => panic!("unexpected"),
 		}
 	}
